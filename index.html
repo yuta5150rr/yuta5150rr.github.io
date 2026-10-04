@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="承認">
+<title>承認</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<main id="app" hidden>
+  <h1>承認</h1>
+  <p class="ver" id="ver"></p>
+
+  <section>
+    <h2>この端末の状態</h2>
+    <dl>
+      <dt>開き方</dt><dd id="st-mode">…</dd>
+      <dt>端末の鍵</dt><dd id="st-device">…</dd>
+      <dt>passkey</dt><dd id="st-passkey">…</dd>
+      <dt>公開の keys.json</dt><dd id="st-published">…</dd>
+    </dl>
+    <div class="row">
+      <button id="btn-check-device" type="button">端末の鍵を確かめる</button>
+      <button id="btn-check-published" type="button">公開の keys.json と照合</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>セットアップ（1回だけ・ホーム画面アプリで）</h2>
+    <ol>
+      <li><button id="btn-device" type="button">端末の鍵を作る</button></li>
+      <li><button id="btn-passkey" type="button">passkey を作る（Face ID）</button></li>
+      <li><button id="btn-save-keys" type="button">keys.json を保存</button><br>共有メニューの「ファイルに保存」→ リポジトリに上げる（コピーと貼り付けは使わない）</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>署名の試験</h2>
+    <button id="btn-test-request" type="button">試験用の依頼を作る</button>
+    <div id="request" hidden>
+      <h3>機械の値（これが正）</h3>
+      <dl id="req-machine"></dl>
+      <h3>AI の説明（AI が書いた文）</h3>
+      <div class="ai" id="req-ai"></div>
+      <p class="mono" id="req-hash"></p>
+      <p class="bad" id="req-block" hidden></p>
+      <button id="btn-approve" type="button">Face ID で承認</button>
+      <button id="btn-save-receipt" type="button" hidden>受領書を保存</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>やり直し</h2>
+    <button id="btn-reset" type="button" class="danger">この端末の鍵を消す</button>
+  </section>
+
+  <section>
+    <h2>記録</h2>
+    <ol class="log" id="log"></ol>
+  </section>
+</main>
+<noscript>JavaScript が必要です。</noscript>
+</body>
+</html>
