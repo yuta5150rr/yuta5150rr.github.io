@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "rp_id": "yuta5150rr.github.io",
+  "passkey": {
+    "credential_id": "Atc2MZXMmKdW-uAbO7YmheKfT9A",
+    "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEujcr8n42of8EE2ZwgXbs-6hwyqIMyHkM8nhdtgvyxo4ux8CqPVpf1oyekrTBl6n7StrqyxSRuigil58XwxMeTg",
+    "alg": -7
+  },
+  "device": {
+    "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEjt7zYERfbkDJbeJFo8FffCjQsYPqo-LMokTCeVL3V6NFthp9WPKVJShgMV_I7UER1DU5TBRBs4RqGPsEQMuPDw",
+    "alg": "ES256"
+  },
+  "created_at": "2026-10-04T10:46:29Z"
+}
