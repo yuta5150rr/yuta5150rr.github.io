@@ -5,13 +5,12 @@ import {
   utf8, toHex, bytesEqual, b64uEncode, isP256Spki, formatTimestamp,
   parseRequest, parseKeys, serializeKeys, serializeReceipt,
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
-  isBroadPattern, patternTouchesForbidden,
+  isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
 
-const PAGE_VERSION = 'stage 0 / v0.1 (2026-10-04)';
+const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const TEST_REPO = 'yuta5150rr/probe';
 const DAY_MS = 24 * 3600 * 1000;
-const CLOCK_SKEW_MS = 5 * 60 * 1000;
 const DB_NAME = 'approval';
 const STORE = 'keys';
 const RECORD_KEY = 'v1';
@@ -217,7 +216,7 @@ async function onCreateDeviceKey() {
   await renderStatus();
 }
 
-// ---------- setup 2: passkey (Face ID). create() is called directly in the tap handler ----------
+// ---------- setup 2: passkey with user verification (WebAuthn UV, usually Face ID). create() is called directly in the tap handler ----------
 function onCreatePasskey() {
   const r = state.record;
   if (!isStandalone() || !r || !r.deviceKeyPair || r.credentialId || state.busy) return;
@@ -254,14 +253,14 @@ function onCreatePasskey() {
     if (!spki || !isP256Spki(spki)) throw new Error('passkey の公開鍵の形が想定と違う');
     if (typeof resp.getAuthenticatorData === 'function') {
       const ad = new Uint8Array(resp.getAuthenticatorData());
-      if (ad.length < 37 || !(ad[32] & 0x04)) throw new Error('Face ID の確認（UV）が立っていない');
+      if (ad.length < 37 || !(ad[32] & 0x04)) throw new Error('本人確認（UV）が立っていない');
     }
     const updated = { ...r, credentialId: new Uint8Array(cred.rawId), passkeyPublicKey: spki, passkeyCreatedAt: Date.now() };
     await dbPut(updated);
     const back = await dbGet();
     if (!back || !back.credentialId || !bytesEqual(back.credentialId, updated.credentialId)) throw new Error('保存の読み戻しが一致しない');
     state.record = back;
-    log('passkey を作った（Face ID）', 'good');
+    log('passkey を作った（本人確認つき）', 'good');
   }).catch((e) => log('passkey を作れなかった: ' + errText(e), 'bad'))
     .finally(() => { state.busy = false; renderStatus(); });
 }
@@ -312,11 +311,16 @@ async function onCheckDevice() {
 }
 
 // ---------- the request: parse the exact bytes, show machine values apart from the AI text ----------
+const BLOCK_TEXT = {
+  NOW_INVALID: '端末の時刻が読めない（署名しない）',
+  CREATED_IN_FUTURE: '作成時刻が未来になっている（署名しない）',
+  APPROVE_BY_PASSED: '承認の締切を過ぎている（署名しない）',
+  VERIFY_BY_PASSED: '検証の締切を過ぎている（署名しない）',
+};
+
 function timeBlock(q, now) {
-  if (q.created_at_ms > now + CLOCK_SKEW_MS) return '作成時刻が未来になっている（署名しない）';
-  if (now >= q.approve_by_ms) return '承認の締切を過ぎている（署名しない）';
-  if (now >= q.verify_by_ms) return '検証の締切を過ぎている（署名しない）';
-  return null;
+  const code = signingBlock(q, now);
+  return code ? BLOCK_TEXT[code] : null;
 }
 
 function addRow(dl, label, value, cls) {
@@ -407,7 +411,7 @@ async function onMakeTestRequest() {
   }
 }
 
-// ---------- approve: passkey (Face ID) + device key over the same challenge ----------
+// ---------- approve: passkey with UV + device key over the same challenge ----------
 function onApprove() {
   const cur = state.current;
   if (!cur || state.busy) return;
@@ -448,6 +452,15 @@ function onApprove() {
       return;
     }
     if (!rec.credentialId || !bytesEqual(rec.credentialId, credentialId)) throw new Error('この端末で登録した passkey ではない');
+    // Check the deadline again right before the device key signs: the prompt may have ended after approve_by.
+    const late = timeBlock(cur.request, Date.now());
+    if (late) {
+      state.currentBlock = late;
+      $('req-block').hidden = false;
+      $('req-block').textContent = late;
+      log('本人確認が終わった時には締切を過ぎていた。受領書は作らない', 'bad');
+      return;
+    }
     const deviceSignature = new Uint8Array(await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' }, rec.deviceKeyPair.privateKey, deviceMessage(cur.challenge)));
     state.receiptText = serializeReceipt({

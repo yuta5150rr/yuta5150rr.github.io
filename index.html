@@ -36,7 +36,7 @@
     <h2>セットアップ（1回だけ・ホーム画面アプリで）</h2>
     <ol>
       <li><button id="btn-device" type="button">端末の鍵を作る</button></li>
-      <li><button id="btn-passkey" type="button">passkey を作る（Face ID）</button></li>
+      <li><button id="btn-passkey" type="button">passkey を作る（本人確認）</button><br>本人確認＝端末のユーザー確認（WebAuthn の UV）。ふだんは Face ID、使えない時は端末のパスコード</li>
       <li><button id="btn-save-keys" type="button">keys.json を保存</button><br>共有メニューの「ファイルに保存」→ リポジトリに上げる（コピーと貼り付けは使わない）</li>
     </ol>
   </section>
@@ -51,7 +51,7 @@
       <div class="ai" id="req-ai"></div>
       <p class="mono" id="req-hash"></p>
       <p class="bad" id="req-block" hidden></p>
-      <button id="btn-approve" type="button">Face ID で承認</button>
+      <button id="btn-approve" type="button">承認する（本人確認）</button>
       <button id="btn-save-receipt" type="button" hidden>受領書を保存</button>
     </div>
   </section>

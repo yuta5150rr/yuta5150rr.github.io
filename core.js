@@ -10,6 +10,7 @@ export const DEVICE_PREFIX = 'approval-device/v1\n';   // device key signs prefi
 export const ALG_ES256 = -7;
 export const MAX_APPROVE_WINDOW_MS = 7 * 24 * 3600 * 1000;   // approve_by - created_at
 export const MAX_VERIFY_WINDOW_MS = 14 * 24 * 3600 * 1000;   // verify_by - created_at
+export const CLOCK_SKEW_MS = 5 * 60 * 1000;                  // created_at may be this far ahead of the device clock
 
 const MAX_REQUEST_BYTES = 16384;
 const MAX_RECEIPT_BYTES = 65536;
@@ -416,6 +417,17 @@ export function parseRequest(bytes) {
     approve_by_ms: approveBy, verify_by_ms: verifyBy, created_at_ms: created,
     nonce: o.nonce,
   });
+}
+
+// The page signs only while this returns null. approve_by is enforced here and nowhere else
+// (a receipt carries no trusted signing time), so the page checks it before the WebAuthn prompt
+// and again right before the device key signs: the prompt can finish after the deadline.
+export function signingBlock(request, nowMs) {
+  if (!Number.isFinite(nowMs)) return 'NOW_INVALID';
+  if (request.created_at_ms > nowMs + CLOCK_SKEW_MS) return 'CREATED_IN_FUTURE';
+  if (nowMs >= request.approve_by_ms) return 'APPROVE_BY_PASSED';
+  if (nowMs >= request.verify_by_ms) return 'VERIFY_BY_PASSED';
+  return null;
 }
 
 export function challengeMessage(requestBytes) {
