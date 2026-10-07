@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "app_id": 5218506,
+  "slug": "yuta5150rr-approver",
+  "other_workflows": {
+    "yuta5150rr/probe": {}
+  }
+}
