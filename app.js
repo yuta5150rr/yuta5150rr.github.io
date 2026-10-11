@@ -134,6 +134,19 @@ function saveFile(name, text) {
 async function renderStatus() {
   const r = state.record;
   const standalone = isStandalone();
+  // Apply the interaction lock before awaiting a key fingerprint.
+  $('btn-device').disabled = state.busy || !standalone || !!r;
+  $('btn-passkey').disabled = state.busy || !standalone || !(r && r.deviceKeyPair) || !!(r && r.credentialId);
+  $('btn-save-keys').disabled = state.busy || !(r && r.deviceKeyPair && r.credentialId);
+  $('btn-check-device').disabled = state.busy;
+  $('btn-check-published').disabled = state.busy;
+  $('btn-test-request').disabled = state.busy;
+  $('btn-approve').disabled = state.busy || !state.current || !!state.currentBlock;
+  $('btn-save-receipt').hidden = !state.receiptText;
+  $('btn-save-receipt').disabled = state.busy;
+  $('request-file').disabled = state.busy;
+  $('btn-return-receipt').disabled = state.busy;
+  $('btn-reset').disabled = state.busy || !r;
   $('st-mode').textContent = standalone ? 'ホーム画面アプリ' : 'ブラウザ（ホーム画面アプリではない）';
   $('st-device').textContent = r && r.deviceKeyPair
     ? 'あり（作成 ' + jst(r.createdAt) + '・指紋 ' + await fingerprint(r.devicePublicKey) + '）'
@@ -147,17 +160,6 @@ async function renderStatus() {
   }[state.publishedStatus];
   $('st-published').textContent = label + (state.publishedDetail ? '（' + state.publishedDetail + '）' : '');
 
-  $('btn-device').disabled = state.busy || !standalone || !!r;
-  $('btn-passkey').disabled = state.busy || !standalone || !(r && r.deviceKeyPair) || !!(r && r.credentialId);
-  $('btn-save-keys').disabled = state.busy || !(r && r.deviceKeyPair && r.credentialId);
-  $('btn-check-device').disabled = state.busy;
-  $('btn-check-published').disabled = state.busy;
-  $('btn-test-request').disabled = state.busy;
-  $('btn-approve').disabled = state.busy || !state.current || !!state.currentBlock;
-  $('btn-save-receipt').hidden = !state.receiptText;
-  $('request-file').disabled = state.busy;
-  $('btn-return-receipt').disabled = state.busy;
-  $('btn-reset').disabled = state.busy || !r;
 }
 
 async function loadPublished() {
@@ -274,6 +276,7 @@ function onCreatePasskey() {
 
 // ---------- setup 3: keys.json out ----------
 function onSaveKeys() {
+  if (state.busy) return;
   const r = state.record;
   if (!r || !r.credentialId) return;
   let text;
@@ -290,14 +293,22 @@ function onSaveKeys() {
 }
 
 async function onCheckPublished() {
-  await loadPublished();
-  await renderStatus();
-  log('公開の keys.json: ' + $('st-published').textContent, state.publishedStatus === 'match' ? 'good' : 'bad');
+  if (state.busy) return;
+  state.busy = true;
+  try {
+    await renderStatus();
+    await loadPublished();
+    await renderStatus();
+    log('公開の keys.json: ' + $('st-published').textContent, state.publishedStatus === 'match' ? 'good' : 'bad');
+  } finally { state.busy = false; await renderStatus(); }
 }
 
 // ---------- device key check (A4: still there after a restart / days without use) ----------
 async function onCheckDevice() {
+  if (state.busy) return;
+  state.busy = true;
   try {
+    await renderStatus();
     const r = await dbGet();
     state.record = r;
     if (!r || !r.deviceKeyPair) {
@@ -313,8 +324,7 @@ async function onCheckDevice() {
     }
   } catch (e) {
     log('端末の鍵を確かめられなかった: ' + errText(e), 'bad');
-  }
-  await renderStatus();
+  } finally { state.busy = false; await renderStatus(); }
 }
 
 // ---------- the request: parse the exact bytes, show machine values apart from the AI text ----------
@@ -402,11 +412,18 @@ function renderRequest() {
   $('req-block').textContent = state.currentBlock || '';
 }
 
-async function loadRequest(bytes) {
+function clearApprovalOutput() {
   state.current = null;
   state.currentBlock = null;
   state.receiptText = null;
+  state.receiptName = null;
+  $('btn-save-receipt').hidden = true;
   $('btn-return-receipt').hidden = true;
+  renderRequest();
+}
+
+async function loadRequest(bytes) {
+  clearApprovalOutput();
   if (bytes.length > MAX_DISCLOSURE_BYTES) throw new Error('依頼が大きすぎます');
   const probe = parseStrictJSON(decodeUtf8Strict(bytes), MAX_DISCLOSURE_BYTES);
   const disclosure = probe?.kind === 'external-disclosure';
@@ -419,8 +436,11 @@ async function loadRequest(bytes) {
 
 async function onMakeTestRequest() {
   if (state.busy) return;
+  state.busy = true;
   state.relay = null;
+  clearApprovalOutput();
   try {
+    await renderStatus();
     const now = Math.floor(Date.now() / 1000) * 1000;
     const stamp = formatTimestamp(now);
     const workId = 'test-' + stamp.slice(0, 10).replace(/-/g, '') + '-' + stamp.slice(11, 19).replace(/:/g, '');
@@ -440,8 +460,7 @@ async function onMakeTestRequest() {
     log('試験用の依頼を作った（' + workId + '）');
   } catch (e) {
     log('依頼を作れなかった: ' + errText(e), 'bad');
-    await renderStatus();
-  }
+  } finally { state.busy = false; await renderStatus(); }
 }
 
 // ---------- approve: passkey with UV + device key over the same challenge ----------
@@ -511,6 +530,7 @@ function onApprove() {
 }
 
 function onSaveReceipt() {
+  if (state.busy) return;
   if (state.receiptText) saveFile(state.receiptName, state.receiptText);
 }
 
@@ -545,13 +565,16 @@ async function returnReceipt() {
   }
 }
 async function loadRelayRequest() {
-  const link = parseRelayFragment(location.hash); if (!link) return;
+  const fragment = location.hash;
+  // A capability must not remain in browser history when loading fails or is busy.
+  if (fragment.startsWith('#xgate=')) history.replaceState(null, '', location.pathname);
+  const link = parseRelayFragment(fragment); if (!link) return;
   if (state.busy) throw new Error('処理中です。終わってから依頼リンクを開き直してください。');
   state.busy = true;
-  state.current = null; state.relay = null; state.receiptText = null;
-  renderRequest();
-  await renderStatus();
+  state.relay = null;
+  clearApprovalOutput();
   try {
+  await renderStatus();
   await loadPublished();
   const config = await fetch('relay-config.json', { credentials: 'omit', redirect: 'error', cache: 'no-store', signal: AbortSignal.timeout(10000) });
   const origin = parseRelayConfig(await boundedResponse(config, 2048));
@@ -565,30 +588,46 @@ async function loadRelayRequest() {
   if (toHex(await sha256(disclosureChallengeMessage(bytes))) !== link.id) throw new Error('依頼の指紋が一致しません');
   await loadRequest(bytes);
   state.relay = { ...link, origin };
-  history.replaceState(null, '', location.pathname); // don't retain the capability in the address bar/history
   log('外部送信の依頼を取得しました。内容を確認してから本人確認してください。');
   } finally { state.busy = false; await renderStatus(); }
 }
 async function onImportRequest(event) {
   if (state.busy) return;
-  state.relay = null;
   const file = event.target.files?.[0]; if (!file) return;
+  state.busy = true;
+  state.relay = null;
+  clearApprovalOutput();
   try {
+    await renderStatus();
     if (file.size > MAX_DISCLOSURE_BYTES) throw new Error('依頼が大きすぎます');
     await loadRequest(new Uint8Array(await file.arrayBuffer()));
     log('ファイルの依頼を読み込みました（返送先は未接続）');
-  } catch (e) { state.current = null; renderRequest(); await renderStatus(); log(errText(e), 'bad'); }
-  event.target.value = '';
+  } catch (e) { clearApprovalOutput(); log(errText(e), 'bad'); }
+  finally { event.target.value = ''; state.busy = false; await renderStatus(); }
 }
 
-function onReset() {
+async function onReturnReceipt() {
+  if (state.busy) return;
+  state.busy = true;
+  try { await renderStatus(); await returnReceipt(); }
+  finally { state.busy = false; await renderStatus(); }
+}
+
+async function onReset() {
   if (!state.record || state.busy) return;
   const ok = window.confirm('この端末の鍵を消す？\n消すと公開中の keys.json と合わなくなり、セットアップからやり直しになる（passkey は「パスワード」アプリから別に消す）。');
   if (!ok) return;
-  dbDelete()
-    .then(() => { state.record = null; state.receiptText = null; log('この端末の鍵を消した'); })
-    .catch((e) => log('消せなかった: ' + errText(e), 'bad'))
-    .finally(() => { loadPublished().then(renderStatus); });
+  state.busy = true;
+  try {
+    await renderStatus();
+    await dbDelete();
+    state.record = null;
+    state.relay = null;
+    clearApprovalOutput();
+    log('この端末の鍵を消した');
+    await loadPublished();
+  } catch (e) { log('消せなかった: ' + errText(e), 'bad'); }
+  finally { state.busy = false; await renderStatus(); }
 }
 
 // ---------- start ----------
@@ -602,6 +641,8 @@ async function init() {
     log('この環境では使えない: ' + problems.join('・'), 'bad');
     return;
   }
+  state.busy = true;
+  await renderStatus();
   $('btn-device').addEventListener('click', onCreateDeviceKey);
   $('btn-passkey').addEventListener('click', onCreatePasskey);
   $('btn-save-keys').addEventListener('click', onSaveKeys);
@@ -611,7 +652,7 @@ async function init() {
   $('btn-approve').addEventListener('click', onApprove);
   $('btn-save-receipt').addEventListener('click', onSaveReceipt);
   $('request-file').addEventListener('change', onImportRequest);
-  $('btn-return-receipt').addEventListener('click', () => { if (!state.busy) returnReceipt(); });
+  $('btn-return-receipt').addEventListener('click', onReturnReceipt);
   $('btn-reset').addEventListener('click', onReset);
   window.addEventListener('hashchange', () => {
     loadRelayRequest().catch(e => log('依頼を取得できません: ' + errText(e), 'bad'));
@@ -622,6 +663,7 @@ async function init() {
     log('保存領域を読めない: ' + errText(e), 'bad');
   }
   await loadPublished();
+  state.busy = false;
   await renderStatus();
   try { await loadRelayRequest(); } catch (e) { log('依頼を取得できません: ' + errText(e), 'bad'); }
   if (!isStandalone()) log('ホーム画面アプリではない。セットアップは「ホーム画面に追加」した方で行う。');
