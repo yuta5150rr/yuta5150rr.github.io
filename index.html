@@ -42,7 +42,9 @@
   </section>
 
   <section>
-    <h2>署名の試験</h2>
+    <h2>承認依頼</h2>
+    <label>依頼ファイルを読み込む <input id="request-file" type="file" accept="application/json,.json"></label>
+    <p>外部送信の承認は、送信先・対象の版・送信内容に限定されます。</p>
     <button id="btn-test-request" type="button">試験用の依頼を作る</button>
     <div id="request" hidden>
       <h3>機械の値（これが正）</h3>
@@ -53,6 +55,7 @@
       <p class="bad" id="req-block" hidden></p>
       <button id="btn-approve" type="button">承認する（本人確認）</button>
       <button id="btn-save-receipt" type="button" hidden>受領書を保存</button>
+      <button id="btn-return-receipt" type="button" hidden>同じ承認結果を受付へ再送</button>
     </div>
   </section>
 

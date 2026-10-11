@@ -1,14 +1,18 @@
-// app.js - approval page, stage 0: setup (device key + passkey), keys.json, and test signing.
-// Nothing is loaded from other origins. Every dynamic text goes through textContent.
+// Existing approval page + disclosure candidate; operator-pinned relay only.
+// Every dynamic text goes through textContent. Default relay config disables networking.
 import {
   RP_ID, ORIGIN, ALG_ES256, FormatError,
   utf8, toHex, bytesEqual, b64uEncode, isP256Spki, formatTimestamp,
   parseRequest, parseKeys, serializeKeys, serializeReceipt,
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
-  isBroadPattern, patternTouchesForbidden, signingBlock,
+  isBroadPattern, patternTouchesForbidden, signingBlock, parseStrictJSON, decodeUtf8Strict,
 } from './core.js';
+import {
+  parseDisclosureRequest, disclosureTimeBlock, disclosureChallengeMessage, disclosureDeviceMessage,
+  parseRelayConfig, parseRelayFragment, MAX_DISCLOSURE_BYTES,
+} from './disclosure-core.js';
 
-const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
+const PAGE_VERSION = 'stage 0 / v0.2 + 外部送信受付候補（未公開）';
 const TEST_REPO = 'yuta5150rr/probe';
 const DAY_MS = 24 * 3600 * 1000;
 const DB_NAME = 'approval';
@@ -26,6 +30,7 @@ const state = {
   receiptText: null,
   receiptName: null,
   busy: false,
+  relay: null, // fixed trusted config origin + one-request capability, never the agent token
 };
 
 // ---------- small helpers ----------
@@ -150,6 +155,8 @@ async function renderStatus() {
   $('btn-test-request').disabled = state.busy;
   $('btn-approve').disabled = state.busy || !state.current || !!state.currentBlock;
   $('btn-save-receipt').hidden = !state.receiptText;
+  $('request-file').disabled = state.busy;
+  $('btn-return-receipt').disabled = state.busy;
   $('btn-reset').disabled = state.busy || !r;
 }
 
@@ -319,6 +326,10 @@ const BLOCK_TEXT = {
 };
 
 function timeBlock(q, now) {
+  if (q.kind === 'external-disclosure') {
+    const code = disclosureTimeBlock(q, now, true);
+    return code ? '期限または端末時刻を確認できないため署名できません（' + code + '）' : null;
+  }
   const code = signingBlock(q, now);
   return code ? BLOCK_TEXT[code] : null;
 }
@@ -342,20 +353,36 @@ function renderRequest() {
   dl.replaceChildren();
   addRow(dl, 'リポジトリ', q.repo, 'mono');
   addRow(dl, '作業 ID', q.work_id, 'mono');
+  if (cur.disclosure) {
+    addRow(dl, '承認する操作', 'コード・契約・試験記録の外部送信');
+    addRow(dl, '送信先', q.destination, 'mono');
+    addRow(dl, '目的', '独立した設計・コードレビュー');
+    addRow(dl, '対象の版', q.head_sha, 'mono');
+    addRow(dl, '送信の締切', jst(q.execute_by_ms));
+    const packets = document.createElement('ul');
+    for (const p of q.payloads) {
+      const li = document.createElement('li'); li.className = 'mono';
+      li.textContent = p.name + ' / ' + p.size + ' bytes / SHA-256 ' + p.sha256;
+      packets.append(li);
+    }
+    addRow(dl, '送信内容の固定値', packets);
+    addRow(dl, '影響', '非公開資料がGoogle Geminiへ渡ります。この承認はmerge・deploy・root操作を含みません。');
+  }
   const ul = document.createElement('ul');
-  for (const p of q.paths) {
+  for (const p of (cur.disclosure ? q.files.map(f => f.path) : q.paths)) {
     const li = document.createElement('li');
     li.className = 'mono';
     const notes = [];
-    if (isBroadPattern(p)) notes.push('** を含む（広い）');
-    if (patternTouchesForbidden(p)) notes.push('禁止の場所に当たりうる（そこを変えると検証で必ず落ちる）');
+    if (!cur.disclosure && isBroadPattern(p)) notes.push('** を含む（広い）');
+    if (!cur.disclosure && patternTouchesForbidden(p)) notes.push('禁止の場所に当たりうる（そこを変えると検証で必ず落ちる）');
     li.textContent = notes.length ? p + '  ← ' + notes.join('・') : p;
+    if (cur.disclosure) li.textContent += ' / SHA-256 ' + q.files.find(f => f.path === p).sha256;
     if (notes.length) li.classList.add('bad');
     ul.append(li);
   }
-  addRow(dl, '変えてよい場所', ul);
+  addRow(dl, cur.disclosure ? '送信対象のファイル' : '変えてよい場所', ul);
   addRow(dl, '承認の締切', jst(q.approve_by_ms) + ' / ' + q.approve_by);
-  addRow(dl, '検証の締切', jst(q.verify_by_ms) + ' / ' + q.verify_by);
+  if (!cur.disclosure) addRow(dl, '検証の締切', jst(q.verify_by_ms) + ' / ' + q.verify_by);
   addRow(dl, '作成', jst(q.created_at_ms) + ' / ' + q.created_at);
 
   const ai = $('req-ai');
@@ -379,14 +406,20 @@ async function loadRequest(bytes) {
   state.current = null;
   state.currentBlock = null;
   state.receiptText = null;
-  const request = parseRequest(bytes); // strict: unknown/duplicate keys, bad characters, bad paths all throw
-  const challenge = await sha256(challengeMessage(bytes));
-  state.current = { bytes, request, challenge };
+  $('btn-return-receipt').hidden = true;
+  if (bytes.length > MAX_DISCLOSURE_BYTES) throw new Error('依頼が大きすぎます');
+  const probe = parseStrictJSON(decodeUtf8Strict(bytes), MAX_DISCLOSURE_BYTES);
+  const disclosure = probe?.kind === 'external-disclosure';
+  const request = disclosure ? parseDisclosureRequest(bytes) : parseRequest(bytes);
+  const challenge = await sha256(disclosure ? disclosureChallengeMessage(bytes) : challengeMessage(bytes));
+  state.current = { bytes: new Uint8Array(bytes), request, challenge, disclosure };
   renderRequest();
   await renderStatus();
 }
 
 async function onMakeTestRequest() {
+  if (state.busy) return;
+  state.relay = null;
   try {
     const now = Math.floor(Date.now() / 1000) * 1000;
     const stamp = formatTimestamp(now);
@@ -415,6 +448,9 @@ async function onMakeTestRequest() {
 function onApprove() {
   const cur = state.current;
   if (!cur || state.busy) return;
+  if (cur.disclosure && (!isStandalone() || state.publishedStatus !== 'match')) {
+    log('ホーム画面アプリで開き、登録した鍵との一致を確認してから承認してください', 'bad'); return;
+  }
   const block = timeBlock(cur.request, Date.now());
   if (block) { log(block, 'bad'); return; }
   const r = state.record;
@@ -462,18 +498,87 @@ function onApprove() {
       return;
     }
     const deviceSignature = new Uint8Array(await crypto.subtle.sign(
-      { name: 'ECDSA', hash: 'SHA-256' }, rec.deviceKeyPair.privateKey, deviceMessage(cur.challenge)));
+      { name: 'ECDSA', hash: 'SHA-256' }, rec.deviceKeyPair.privateKey,
+      cur.disclosure ? disclosureDeviceMessage(cur.challenge) : deviceMessage(cur.challenge)));
     state.receiptText = serializeReceipt({
       requestBytes: cur.bytes, credentialId, authenticatorData, clientDataJSON, passkeySignature, deviceSignature,
     });
     state.receiptName = 'receipt-' + cur.request.work_id + '.json';
     log('受領書を作った（' + cur.request.work_id + '）。「受領書を保存」で渡す', 'good');
+    if (cur.disclosure && state.relay) await returnReceipt();
   }).catch((e) => log('承認できなかった: ' + errText(e), 'bad'))
     .finally(() => { state.busy = false; renderStatus(); });
 }
 
 function onSaveReceipt() {
   if (state.receiptText) saveFile(state.receiptName, state.receiptText);
+}
+
+async function boundedResponse(res, limit) {
+  if (!res.ok) throw new Error('受付の応答 HTTP ' + res.status);
+  const reader = res.body.getReader(); const parts = []; let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read(); if (done) break;
+      size += value.length; if (size > limit) throw new Error('受付の応答が大きすぎます'); parts.push(value);
+    }
+  } finally { await reader.cancel().catch(() => {}); }
+  const bytes = new Uint8Array(size); let offset = 0;
+  for (const part of parts) { bytes.set(part, offset); offset += part.length; }
+  return bytes;
+}
+async function returnReceipt() {
+  const relay = state.relay, cur = state.current;
+  if (!relay || !state.receiptText || !cur?.disclosure) return;
+  try {
+    const res = await fetch(relay.origin + '/approval/' + relay.id + '/receipt', {
+      method: 'POST', headers: { Authorization: 'XGate ' + relay.cap, 'Content-Type': 'application/json' },
+      body: state.receiptText, credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(10000),
+    });
+    const result = parseStrictJSON(decodeUtf8Strict(await boundedResponse(res, 2048)), 2048);
+    if (result.request_id !== relay.id || result.state !== 'approved') throw new Error('受領確認が一致しません');
+    log('承認結果を受付へ返しました。ChatGPT側の審査は別に行われます。', 'good');
+    $('btn-return-receipt').hidden = true;
+  } catch (e) {
+    log('承認結果の返送を確認できません。再送は同じ受領書で行います: ' + errText(e), 'bad');
+    $('btn-return-receipt').hidden = false;
+  }
+}
+async function loadRelayRequest() {
+  const link = parseRelayFragment(location.hash); if (!link) return;
+  if (state.busy) throw new Error('処理中です。終わってから依頼リンクを開き直してください。');
+  state.busy = true;
+  state.current = null; state.relay = null; state.receiptText = null;
+  renderRequest();
+  await renderStatus();
+  try {
+  await loadPublished();
+  const config = await fetch('relay-config.json', { credentials: 'omit', redirect: 'error', cache: 'no-store', signal: AbortSignal.timeout(10000) });
+  const origin = parseRelayConfig(await boundedResponse(config, 2048));
+  if (!origin) throw new Error('依頼受付との接続は未設定です。この候補版では承認依頼を取得できません。');
+  const res = await fetch(origin + '/approval/' + link.id, {
+    headers: { Authorization: 'XGate ' + link.cap }, credentials: 'omit', redirect: 'error', cache: 'no-store',
+    referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(10000),
+  });
+  const bytes = await boundedResponse(res, MAX_DISCLOSURE_BYTES);
+  parseDisclosureRequest(bytes); // relay links never load a PR-v1 request
+  if (toHex(await sha256(disclosureChallengeMessage(bytes))) !== link.id) throw new Error('依頼の指紋が一致しません');
+  await loadRequest(bytes);
+  state.relay = { ...link, origin };
+  history.replaceState(null, '', location.pathname); // don't retain the capability in the address bar/history
+  log('外部送信の依頼を取得しました。内容を確認してから本人確認してください。');
+  } finally { state.busy = false; await renderStatus(); }
+}
+async function onImportRequest(event) {
+  if (state.busy) return;
+  state.relay = null;
+  const file = event.target.files?.[0]; if (!file) return;
+  try {
+    if (file.size > MAX_DISCLOSURE_BYTES) throw new Error('依頼が大きすぎます');
+    await loadRequest(new Uint8Array(await file.arrayBuffer()));
+    log('ファイルの依頼を読み込みました（返送先は未接続）');
+  } catch (e) { state.current = null; renderRequest(); await renderStatus(); log(errText(e), 'bad'); }
+  event.target.value = '';
 }
 
 function onReset() {
@@ -505,7 +610,12 @@ async function init() {
   $('btn-test-request').addEventListener('click', onMakeTestRequest);
   $('btn-approve').addEventListener('click', onApprove);
   $('btn-save-receipt').addEventListener('click', onSaveReceipt);
+  $('request-file').addEventListener('change', onImportRequest);
+  $('btn-return-receipt').addEventListener('click', () => { if (!state.busy) returnReceipt(); });
   $('btn-reset').addEventListener('click', onReset);
+  window.addEventListener('hashchange', () => {
+    loadRelayRequest().catch(e => log('依頼を取得できません: ' + errText(e), 'bad'));
+  });
   try {
     state.record = await dbGet();
   } catch (e) {
@@ -513,6 +623,7 @@ async function init() {
   }
   await loadPublished();
   await renderStatus();
+  try { await loadRelayRequest(); } catch (e) { log('依頼を取得できません: ' + errText(e), 'bad'); }
   if (!isStandalone()) log('ホーム画面アプリではない。セットアップは「ホーム画面に追加」した方で行う。');
 }
 
