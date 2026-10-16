@@ -7,7 +7,7 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
-import { loadFixedRequest, receiptReturnUrl } from './fragment.js?v=3d'; // versioned: a cached v0.3c module would reject the resume path
+import { loadFixedRequest, receiptReturnUrl, requestFromFragment } from './fragment.js?v=3e'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const TEST_REPO = 'yuta5150rr/probe';
@@ -503,6 +503,18 @@ function clearPendingRequest() {
   renderStatus().catch(() => {});
 }
 
+// A request handed over by the owner's private Site (/pending) in the URL fragment; the app's own strict parseRequest still decides whether it can be signed.
+async function loadRequestFromFragment(bytes) {
+  try {
+    await loadRequest(bytes);
+    state.imported = true;
+    log('Siteから署名待ちの依頼を受け取った。機械の値を確かめてから承認する', 'good');
+  } catch (e) {
+    clearPendingRequest();
+    log('Siteから受け取った依頼を表示できなかった: ' + errText(e), 'bad');
+  }
+}
+
 // Reads the ONE fixed same-origin file (connect-src 'self'); the app's own strict parseRequest still decides whether it can be signed.
 async function loadPendingRequest() {
   const r = await loadFixedRequest((u, init) => fetch(u, init));
@@ -565,7 +577,9 @@ async function init() {
   reload.textContent = '署名待ちの依頼を読み込み直す';
   reload.addEventListener('click', () => { if (!state.busy) loadPendingRequest(); });
   $('btn-test-request').before(reload, document.createElement('br'));
-  await loadPendingRequest();
+  const fromHash = requestFromFragment(location.hash);
+  if (location.hash.startsWith('#req=')) history.replaceState(null, '', location.pathname + location.search); // the fragment is single-use
+  if (fromHash) await loadRequestFromFragment(fromHash); else await loadPendingRequest();
   if (!isStandalone()) log('ホーム画面アプリではない。セットアップは「ホーム画面に追加」した方で行う。');
 }
 

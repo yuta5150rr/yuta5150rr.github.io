@@ -6,7 +6,7 @@ export const SITES_ORIGIN = 'https://xgate-connector.tainakaritsu903729.chatgpt.
 export const RECEIPT_URL = SITES_ORIGIN + '/receipt';
 export const REQUEST_FILE = 'dotprobe-request.json';
 export const FIXED_REPO = 'yuta5150rr/dot-probe';
-export const FIXED_PATHS = Object.freeze(['dot-probe/readonly-status-check', 'dot-probe/enroll-key-binding', 'dot-probe/claude-resume-readonly']);
+export const FIXED_PATHS = Object.freeze(['dot-probe/readonly-status-check', 'dot-probe/enroll-key-binding', 'dot-probe/claude-resume-readonly', 'dot-probe/flex-readonly-report']);
 export const MAX_REQUEST_BYTES = 16384;
 const MAX_FRAGMENT_RECEIPT_BYTES = 65536;
 
@@ -57,6 +57,18 @@ export async function loadFixedRequest(fetchFn) {
   for (const c of chunks) { bytes.set(c, off); off += c.length; }
   const ok = acceptRequestFileBytes(bytes);
   return ok ? { status: 'ok', bytes: ok } : { status: 'bad', reason: 'not a fixed canonical request' };
+}
+
+// #req=<base64url of the exact canonical request bytes> (issued by the owner's private Site /pending page) -> same strict acceptance as the fixed file.
+// The fragment never reaches a server. Non-canonical base64url, wrong size, or any strictness failure => null.
+export function requestFromFragment(hash) {
+  const m = /^#req=([A-Za-z0-9_-]{2,22000})$/.exec(typeof hash === 'string' ? hash : '');
+  if (!m || m[1].length % 4 === 1) return null;
+  let bin;
+  try { bin = atob(m[1].replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (m[1].length % 4)) % 4)); } catch (e) { return null; }
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  if (bytesToB64u(bytes) !== m[1]) return null;
+  return acceptRequestFileBytes(bytes);
 }
 
 // receipt text -> the fixed return URL. No other destination can be produced.
