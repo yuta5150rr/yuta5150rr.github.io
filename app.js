@@ -215,6 +215,7 @@ async function onCreateDeviceKey() {
     log('端末の鍵を作れなかった: ' + errText(e), 'bad');
   }
   state.busy = false;
+  runDeferredIncoming();
   await renderStatus();
 }
 
@@ -264,7 +265,7 @@ function onCreatePasskey() {
     state.record = back;
     log('passkey を作った（本人確認つき）', 'good');
   }).catch((e) => log('passkey を作れなかった: ' + errText(e), 'bad'))
-    .finally(() => { state.busy = false; renderStatus(); });
+    .finally(() => { state.busy = false; renderStatus(); runDeferredIncoming(); });
 }
 
 // ---------- setup 3: keys.json out ----------
@@ -474,7 +475,7 @@ function onApprove() {
     log('受領書を作った（' + cur.request.work_id + '）。「受領書を保存」で渡す', 'good');
     if (state.imported) returnToSites();
   }).catch((e) => log('承認できなかった: ' + errText(e), 'bad'))
-    .finally(() => { state.busy = false; renderStatus(); });
+    .finally(() => { state.busy = false; renderStatus(); runDeferredIncoming(); });
 }
 
 // One-way return: top-level navigation to ONE fixed Sites page, receipt in the fragment. No return trip to this app is needed.
@@ -513,11 +514,12 @@ function returnToSites() {
 async function startupLoad() {
   const fromHash = requestFromFragment(location.hash);
   const hadFragment = location.hash.startsWith('#req=');
+  const raw0 = location.hash;
   if (fromHash) {
     const out = await loadRequestFromFragment(fromHash);
-    if (out.saved || !out.shown) history.replaceState(null, '', location.pathname + location.search);
+    if (out.saved || !out.shown) scrubIf(raw0);
   } else if (hadFragment) {
-    history.replaceState(null, '', location.pathname + location.search);       // unusable fragment: nothing to keep
+    scrubIf(raw0);       // unusable fragment: nothing to keep
     log('Siteから受け取った依頼が正しい形式ではなかった。保存済みの依頼があればそれを使う', 'bad'); await restoreSavedPending(false, false);
   } else await restoreSavedPending(true, false);
   await redeliverPendingReceipts();
@@ -532,6 +534,34 @@ function offerRecoveryLink(item) {
   a.href = receiptReturnUrl(item.receiptText);
   a.onclick = () => { noteReceiptAttempt(pendingStorage(), item.id); };
 }
+// Incoming #req while this document is ALREADY open (hashchange, pageshow / back-forward cache restore). Serialized; the latest URL wins (the hash is read when the
+// run starts, never captured earlier); never swaps the target while a signing is in progress (deferred until it ends); an invalid fragment changes nothing but says so.
+let incomingRunning = false, incomingDirty = false, incomingDeferred = false;
+// removes the fragment only if it is still the one that was processed: a newer #req that arrived meanwhile must survive for the follow-up run
+function scrubIf(raw) { if (location.hash === raw) history.replaceState(null, '', location.pathname + location.search); }
+async function applyIncomingFragment() {
+  const raw = location.hash;
+  if (!raw.startsWith('#req=')) return;
+  const bytes = requestFromFragment(raw);
+  if (!bytes) { scrubIf(raw); log('Siteから受け取った依頼が正しい形式ではない。表示中の依頼は変えない', 'bad'); return; }
+  if (state.current && state.current.bytes.length === bytes.length && state.current.bytes.every((x, i) => x === bytes[i])) return;   // already the displayed target
+  const out = await loadRequestFromFragment(bytes);
+  if (out.saved || !out.shown) scrubIf(raw);
+  await redeliverPendingReceipts();
+}
+async function drainIncoming() {
+  if (incomingRunning) { incomingDirty = true; return; }
+  incomingRunning = true;
+  try {
+    do {
+      incomingDirty = false;
+      if (state.busy) { incomingDeferred = true; return; }
+      await applyIncomingFragment();
+    } while (incomingDirty);
+  } finally { incomingRunning = false; }
+}
+function runDeferredIncoming() { if (incomingDeferred) { incomingDeferred = false; return drainIncoming(); } }
+
 async function redeliverPendingReceipts() {
   const r = await loadReceipts(pendingStorage(), Date.now(), pendingHash);
   for (const d of r.dropped) log('保存した受領書を使わない（' + d.reason + '）', d.reason === 'expired' ? undefined : 'bad');
@@ -563,12 +593,13 @@ function clearPendingRequest() {
 // A request handed over by the owner's private Site (/pending) in the URL fragment; the app's own strict parseRequest still decides whether it can be signed.
 function pendingStorage() { try { return window.localStorage; } catch (e) { return null; } }
 async function pendingHash(bytes) { return toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); }
+function workIdOf(bytes) { try { return String(JSON.parse(new TextDecoder().decode(bytes)).work_id).slice(0, 40); } catch (e) { return '?'; } }
 async function loadRequestFromFragment(bytes) {
   const saved = savePendingRequest(pendingStorage(), bytes, await pendingHash(bytes), Date.now(), 'fragment');
   try {
     await loadRequest(bytes);
     state.imported = true;
-    if (saved.ok) { setUnsavedMark(false); log('Siteから署名待ちの依頼を受け取り、この端末に保存した。機械の値を確かめてから承認する', 'good'); }
+    if (saved.ok) { setUnsavedMark(false); log('Siteから署名待ちの依頼（' + workIdOf(bytes) + '）を受け取り、この端末に保存した。機械の値を確かめてから承認する', 'good'); }
     else { setUnsavedMark(true); log('Siteから署名待ちの依頼を受け取ったが、この端末に保存できなかった（' + saved.reason + '）。URLの依頼は消さずに残す（再読込しても同じ依頼を読み直す）。古い公開ファイルは自動では読まない。機械の値を確かめてから承認する', 'bad'); }
     return { shown: true, saved: saved.ok };
   } catch (e) {
@@ -633,7 +664,16 @@ function onReset() {
 }
 
 // ---------- start ----------
+// Listeners are registered FIRST and the serializer stays gated (incomingRunning) for the whole startup (dbGet, loadPublished, startupLoad), so a #req that arrives
+// meanwhile is never lost and never applied before initialization is safe; whatever is still pending is drained exactly once afterwards.
 async function init() {
+  incomingRunning = true;
+  window.addEventListener('hashchange', () => { drainIncoming(); });
+  window.addEventListener('pageshow', () => { drainIncoming(); });
+  try { await initInner(); } finally { incomingRunning = false; }
+  if (incomingDirty || location.hash.startsWith('#req=')) await drainIncoming();
+}
+async function initInner() {
   if (window.top !== window.self) return; // never run inside a frame; the page stays blank
   $('app').hidden = false;
   $('ver').textContent = PAGE_VERSION;
