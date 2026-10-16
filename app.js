@@ -7,7 +7,7 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
-import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES } from './fragment.js?v=3i'; // versioned: a cached v0.3c module would reject the resume path
+import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3j'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const TEST_REPO = 'yuta5150rr/probe';
@@ -509,13 +509,88 @@ function returnToSites() {
 
 // Re-delivers the stored signed receipt(s), byte for byte, to the ONE fixed Site URL. Same bytes -> the Site is idempotent; no new signature is ever made.
 // Automatic navigation is bounded (MAX_AUTO_REDELIVERIES per receipt); after that only the explicit link remains. Expired / invalid items were dropped by loadReceipts.
+async function routeAllows(bytes) { return routeMatchesRequest(location.search, await pendingHash(bytes)); }
+function noteNotificationRoute() { const r = routeFromSearch(location.search); if (r.n === 'received') log('通知から開いた: 署名の受領書が記録された（依頼 ' + r.r + '）。実行の完了を待つ', 'good'); else if (r.n === 'completed') log('通知から開いた: 読取専用の確認が完了した（依頼 ' + r.r + '）', 'good'); }
+// Web push (candidate). INERT until VAPID_PUBLIC_B64U is set. The permission request MUST run inside the click handler (user gesture); nothing here signs, stores a receipt or reads keys.
+function pushSupported() { return typeof navigator !== 'undefined' && 'serviceWorker' in navigator && typeof window !== 'undefined' && 'PushManager' in window && 'Notification' in window; }
+function onEnablePush() {
+  if (!pushSupported()) { log('このブラウザは通知に未対応（ホーム画面に追加したアプリで使える）', 'bad'); return; }
+  const key = VAPID_PUBLIC_B64U ? b64uToBytes(VAPID_PUBLIC_B64U) : null;
+  if (!key || key.length !== 65) { log('通知の公開鍵が未設定のため通知を有効にできない（承認後に設定）', 'bad'); return; }
+  Notification.requestPermission().then(async (perm) => {        // called synchronously from the tap
+    if (perm !== 'granted') { log('通知が許可されなかった。設定アプリの通知から許可できる', 'bad'); return; }
+    const reg = (await navigator.serviceWorker.getRegistration()) || (await navigator.serviceWorker.register('sw.js', { scope: './' }));
+    await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (sub && !sameBytes(new Uint8Array(sub.options.applicationServerKey), key)) {   // an existing subscription for ANOTHER key is never replaced automatically
+      showPushReset();
+      log('この端末は別の公開鍵で通知を登録済み。自動では置き換えない。鍵を替える場合だけ、下の「通知の登録をリセット」を意図して押す', 'bad');
+      return;
+    }
+    sub = sub || (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }));
+    const url = buildEnrollmentUrl(sub.toJSON());
+    if (!url) { log('購読情報が想定外の形のため登録しない', 'bad'); return; }
+    log('通知を許可した。Siteへこの端末の通知設定を登録する', 'good');
+    location.assign(url);
+  }).catch((e) => log('通知を有効にできなかった: ' + errText(e), 'bad'));
+}
+// The message must come from THIS origin's own registered sw.js (any of its installing/waiting/active workers: right after the first installation the page is not controlled yet,
+// so navigator.serviceWorker.controller may be null and is NOT required). Foreign sources / origins / scripts are dropped before the payload is even looked at.
+async function swMessageTrusted(ev) {
+  if (!ev || ev.origin !== location.origin || !ev.source || typeof ev.source !== 'object') return false;
+  let reg = null; try { reg = await navigator.serviceWorker.getRegistration(); } catch (e) { return false; }
+  if (!reg) return false;
+  const workers = [reg.installing, reg.waiting, reg.active].filter(Boolean);
+  return workers.includes(ev.source) && ev.source.scriptURL === new URL('sw.js', location.href).href;
+}
+async function onSwMessage(ev) {
+  if (!(await swMessageTrusted(ev))) { log('通知アプリ以外からのメッセージを無視した', 'bad'); return; }
+  const d = ev.data;
+  if (d && typeof d === 'object' && d.type === 'xgate-displayed') {   // the worker really called showNotification: this is the only "displayed" evidence the app can have
+    if (Object.keys(d).sort().join() === 'id,kind,type' && ['approve', 'received', 'completed', 'test'].includes(d.kind) && /^[0-9a-f]{64}$/.test(d.id)) log('通知が端末に表示された（' + d.kind + '）', 'good'); else log('不正な表示メッセージを無視した', 'bad');
+    return;
+  }
+  const m = await verifyOpenMessage(d, async (b) => pendingHash(b));
+  if (!m.ok) { log('通知アプリからの不正なメッセージを無視した', 'bad'); return; }
+  if (m.kind === 'approve') { history.replaceState(null, '', location.pathname + '?r=' + m.id.slice(0, 16) + '#req=' + m.req); await drainIncoming(); }   // busy-safe: never swaps a target while signing
+  else log(m.kind === 'received' ? '通知: 署名の受領書が記録された' : '通知: 読取専用の確認が完了した', 'good');
+}
+// explicit, deliberate: only the button the user presses after the mismatch message
+function showPushReset() { const b = $('btn-reset-push'); if (b) b.hidden = false; }
+async function onResetPush() {
+  try { const reg = await navigator.serviceWorker.getRegistration(); const sub = reg && (await reg.pushManager.getSubscription()); if (sub) await sub.unsubscribe(); log('この端末の通知の登録をリセットした。もう一度「通知を有効にする」を押す', 'good'); const b = $('btn-reset-push'); if (b) b.hidden = true; }
+  catch (e) { log('リセットできなかった: ' + errText(e), 'bad'); }
+}
+// device-local display check: shows a test notification through the SAME service worker code path, with NO push service, key or server involved (needs the permission only)
+async function onLocalDisplayTest() {
+  try {
+    if (!pushSupported() || Notification.permission !== 'granted') { log('先に「通知を有効にする」で通知を許可してください', 'bad'); return; }
+    const reg = await navigator.serviceWorker.getRegistration(); if (!reg) { log('通知用ワーカーが未登録', 'bad'); return; }
+    await reg.showNotification('通知テスト', { body: 'この端末内の表示テストです（Siteは経由しません）。', tag: 'xgate-local-test', data: { kind: 'test', id: '0'.repeat(64), req: null } });
+    log('端末内の表示テストを出した。通知が表示されたか確認してください', 'good');
+  } catch (e) { log('表示テストを出せなかった: ' + errText(e), 'bad'); }
+}
+function setupPush() {
+  if (!pushSupported() || !VAPID_PUBLIC_B64U) return;            // inert: no worker, no button
+  navigator.serviceWorker.register('sw.js', { scope: './' }).catch((e) => log('通知用ワーカーを登録できなかった: ' + errText(e), 'bad'));
+  navigator.serviceWorker.addEventListener('message', (ev) => { onSwMessage(ev); });
+  if (typeof navigator.serviceWorker.startMessages === 'function') navigator.serviceWorker.startMessages();   // addEventListener (unlike onmessage) does not start the message queue
+  const b = document.createElement('button'); b.type = 'button'; b.id = 'btn-enable-push'; b.textContent = '通知を有効にする（この端末）';
+  b.addEventListener('click', () => { onEnablePush(); });
+  const lt = document.createElement('button'); lt.type = 'button'; lt.id = 'btn-local-notify-test'; lt.textContent = '通知の表示テスト（この端末内）'; lt.addEventListener('click', () => { onLocalDisplayTest(); });
+  const rs = document.createElement('button'); rs.type = 'button'; rs.id = 'btn-reset-push'; rs.hidden = true; rs.textContent = '通知の登録をリセット（意図して押す）'; rs.addEventListener('click', () => { onResetPush(); });
+  $('btn-test-request').before(b, document.createElement('br'), lt, document.createElement('br'), rs, document.createElement('br'));
+}
+
 // Startup. The #req fragment is scrubbed ONLY after its exact bytes are durably saved (or when it cannot be used at all);
 // if saving failed the original fragment stays in the URL, so a reload re-imports the very same target instead of falling back to the old public file.
 async function startupLoad() {
   const fromHash = requestFromFragment(location.hash);
   const hadFragment = location.hash.startsWith('#req=');
   const raw0 = location.hash;
-  if (fromHash) {
+  if (fromHash && !(await routeAllows(fromHash))) {   // a notification/Site URL names its request (?r=<id16>): the bytes must be that request, else nothing is loaded
+    scrubIf(raw0); log('開いたURLの依頼IDと依頼の内容が一致しない。読み込まない', 'bad'); await restoreSavedPending(false, false);
+  } else if (fromHash) {
     const out = await loadRequestFromFragment(fromHash);
     if (out.saved || !out.shown) scrubIf(raw0);
   } else if (hadFragment) {
@@ -523,6 +598,7 @@ async function startupLoad() {
     log('Siteから受け取った依頼が正しい形式ではなかった。保存済みの依頼があればそれを使う', 'bad'); await restoreSavedPending(false, false);
   } else await restoreSavedPending(true, false);
   await redeliverPendingReceipts();
+  noteNotificationRoute();
 }
 
 // An unrelated old receipt is NEVER auto-delivered over a target the user is looking at: automatic re-delivery is only for the receipt that matches the
@@ -741,6 +817,7 @@ async function initInner() {
   reload.textContent = '署名待ちの依頼を読み込み直す';
   reload.addEventListener('click', () => { refreshFromFixedFile(); });
   $('btn-test-request').before(reload, document.createElement('br'));
+  setupPush();
   await startupLoad();
   if (!isStandalone()) log('ホーム画面アプリではない。セットアップは「ホーム画面に追加」した方で行う。');
 }

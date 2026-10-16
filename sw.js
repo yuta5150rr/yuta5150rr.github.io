@@ -1,0 +1,64 @@
+// sw.js - service worker for web push ONLY: `push` and `notificationclick`.
+// No `fetch` handler, no Cache/Cache Storage, no skipWaiting/claim: it cannot intercept, cache or serve any page, so it can never make an approval screen stale.
+// Notification texts come from this file by kind, never from the payload. A click can only open THIS app's own scope with a request that is cryptographically bound to the id
+// (sha-256 of the carried request bytes == id); anything else opens the plain app root. Nothing is ever signed, stored or sent from here.
+'use strict';
+const KINDS = ['approve', 'received', 'completed', 'test'];
+const TEXTS = {
+  approve: ['承認が必要です', '署名待ちの確認が1件あります（読取のみ）。タップして承認画面を開きます。'],
+  received: ['署名を受領しました', '受領書を記録しました。実行の完了通知を待っています。'],
+  completed: ['実行が完了しました', '読取専用の確認が完了しました。'],
+  test: ['通知テスト', 'この端末への通知が有効です。'],
+};
+const GENERIC = ['確認があります', 'アプリを開いて確認してください。'];
+const HEX64 = /^[0-9a-f]{64}$/;
+const unb64u = (s) => { if (typeof s !== 'string' || !/^[A-Za-z0-9_-]*$/.test(s) || s.length % 4 === 1) return null; const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4)); const u = Uint8Array.from(bin, (c) => c.charCodeAt(0)); return btoa(String.fromCharCode.apply(null, u)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') === s ? u : null; };
+const sha256Hex = async (u8) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', u8)), (x) => x.toString(16).padStart(2, '0')).join('');
+// -> { ok, kind, id, req } | { ok:false }
+async function parse(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o) || o.v !== 1 && o.v !== undefined) return { ok: false };
+  if (!KINDS.includes(o.kind) || typeof o.id !== 'string' || !HEX64.test(o.id)) return { ok: false };
+  if (o.kind === 'approve') { const b = unb64u(o.req); if (!b || b.length > 2000 || (await sha256Hex(b)) !== o.id) return { ok: false }; return { ok: true, kind: o.kind, id: o.id, req: o.req }; }
+  if (o.req !== undefined && o.req !== null) return { ok: false };
+  return { ok: true, kind: o.kind, id: o.id, req: null };
+}
+async function parsePayloadText(text) {
+  let o; try { o = JSON.parse(text); } catch (e) { return { ok: false }; }
+  if (!o || typeof o !== 'object' || Array.isArray(o) || o.v !== 1 || !Number.isFinite(o.ts)) return { ok: false };
+  const keys = Object.keys(o).sort().join();
+  if (keys !== (o.kind === 'approve' ? 'id,kind,req,ts,v' : 'id,kind,ts,v')) return { ok: false };
+  return parse(o);
+}
+async function onPush(event) {
+  let p = { ok: false };
+  try { p = await parsePayloadText(event.data ? event.data.text() : ''); } catch (e) { p = { ok: false }; }
+  // Safari revokes the permission if a push is not shown: ALWAYS show something, even for an undecryptable / malformed payload.
+  if (!p.ok) return self.registration.showNotification(GENERIC[0], { body: GENERIC[1], tag: 'xgate-generic', data: null });
+  const t = TEXTS[p.kind];
+  await self.registration.showNotification(t[0], { body: t[1], tag: p.kind + '-' + p.id.slice(0, 16), renotify: false, data: { kind: p.kind, id: p.id, req: p.req } });
+  // best effort, AFTER showNotification resolved: tell an open app window that the notification really was displayed (the push service's HTTP 201 only means "accepted")
+  try { for (const c of await clients.matchAll({ type: 'window', includeUncontrolled: true })) if (typeof c.url === 'string' && c.url.startsWith(self.registration.scope)) c.postMessage({ type: 'xgate-displayed', kind: p.kind, id: p.id }); } catch (e) { /* display already happened */ }
+}
+// the ONLY URLs this worker can produce: the app's own scope, optionally with ?r=<id16>#req=<verified request> or ?n=<kind>&r=<id16>
+async function targetFor(data) {
+  const scope = self.registration.scope;
+  let p = { ok: false }; try { p = await parse(data); } catch (e) { p = { ok: false }; }
+  if (!p.ok || p.kind === 'test') return { url: scope, message: null };
+  const id16 = p.id.slice(0, 16);
+  if (p.kind === 'approve') return { url: scope + '?r=' + id16 + '#req=' + p.req, message: { type: 'xgate-open', kind: p.kind, id: p.id, req: p.req } };
+  return { url: scope + '?n=' + p.kind + '&r=' + id16, message: { type: 'xgate-open', kind: p.kind, id: p.id, req: null } };
+}
+async function onClick(event) {
+  event.notification.close();
+  const t = await targetFor(event.notification.data);
+  const scope = self.registration.scope;
+  const wins = (await clients.matchAll({ type: 'window', includeUncontrolled: true })).filter((c) => typeof c.url === 'string' && c.url.startsWith(scope));
+  if (wins.length) {                       // the open app decides (it never swaps a target while a signing is in progress)
+    const c = wins[0]; try { await c.focus(); } catch (e) { /* best effort */ }
+    if (t.message) c.postMessage(t.message);
+    return;
+  }
+  await clients.openWindow(t.url);
+}
+self.addEventListener('push', (event) => { event.waitUntil(onPush(event)); });
+self.addEventListener('notificationclick', (event) => { event.waitUntil(onClick(event)); });

@@ -78,7 +78,7 @@ export const PENDING_KEY = 'xgate-pending-request/v1';
 const PENDING_KEYS = 'v,request_b64u,sha256,saved_ms,source,signed';
 const TS = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
 const SKEW_MS = 5 * 60 * 1000;
-function b64uToBytes(s) {
+export function b64uToBytes(s) {
   if (typeof s !== 'string' || !/^[A-Za-z0-9_-]+$/.test(s) || s.length % 4 === 1) return null;
   let bin; try { bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4)); } catch (e) { return null; }
   const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
@@ -189,6 +189,39 @@ export function noteReceiptAttempt(storage, id) {
   return writeReceiptItems(storage, cur.map((x) => (x && x.id === id ? { ...x, attempts: Math.min(99, (x.attempts | 0) + 1) } : x)));
 }
 export function clearReceipt(storage, id) { const cur = readReceiptItems(storage); return cur === null ? false : writeReceiptItems(storage, cur.filter((x) => !(x && x.id === id))); }
+
+// ---- web push (candidate) ----
+// The server's VAPID public key (applicationServerKey). null = push is inert (no permission request, no service worker). Set ONLY after the approved key generation.
+export const VAPID_PUBLIC_B64U = "BI3-cEHkc3796SFQC-NiZ9VYm1JfpP353pB2wWPePHPITrOdcxEl1tbVZrKdcdFVcaSpQNwH8Sj53tZYLn_PXMU";
+export const PUSH_ENROLL_URL = SITES_ORIGIN + '/push';
+const PUSH_PATH = /^\/[A-Za-z0-9_-]{16,400}$/;
+// PushSubscription.toJSON() -> the fixed Site enrollment URL (subscription in the fragment: never sent to a server by the browser), or null. The Site validates again.
+export function buildEnrollmentUrl(sub) {
+  try {
+    if (!sub || typeof sub !== 'object' || Array.isArray(sub)) return null;
+    const k = Object.keys(sub).sort().join(); if (k !== 'endpoint,keys' && k !== 'endpoint,expirationTime,keys') return null;
+    if (sub.expirationTime !== undefined && sub.expirationTime !== null) return null;
+    const u = new URL(sub.endpoint); if (u.protocol !== 'https:' || u.hostname !== 'web.push.apple.com' || u.port || u.username || u.password || u.search || u.hash || !PUSH_PATH.test(u.pathname) || u.href !== sub.endpoint) return null;
+    if (!sub.keys || Object.keys(sub.keys).sort().join() !== 'auth,p256dh') return null;
+    const p = b64uToBytes(sub.keys.p256dh), a = b64uToBytes(sub.keys.auth); if (!p || p.length !== 65 || p[0] !== 4 || !a || a.length !== 16) return null;
+    return PUSH_ENROLL_URL + '#e=' + bytesToB64u(new TextEncoder().encode(JSON.stringify({ endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } })));
+  } catch (e) { return null; }
+}
+// ?r=<id16>  |  ?n=received|completed&r=<id16>  -> { r, n }  (anything else is ignored: no route)
+export function routeFromSearch(search) {
+  const m = /^\?r=([0-9a-f]{16})$/.exec(search) || null; if (m) return { r: m[1], n: null };
+  const n = /^\?n=(received|completed)&r=([0-9a-f]{16})$/.exec(search); return n ? { r: n[2], n: n[1] } : { r: null, n: null };
+}
+// a notification-opened URL names the request it is for: the carried bytes must hash to it. No route => nothing to compare.
+export function routeMatchesRequest(search, sha256Hex) { const { r } = routeFromSearch(search); return r === null || (typeof sha256Hex === 'string' && sha256Hex.startsWith(r)); }
+// message from the service worker (notification tapped while the app is open) -> { ok, kind, id, bytes } ; the id must be the hash of the carried request
+export async function verifyOpenMessage(data, sha256Of) {
+  if (!data || typeof data !== 'object' || Array.isArray(data) || data.type !== 'xgate-open' || Object.keys(data).sort().join() !== 'id,kind,req,type') return { ok: false };
+  if (!['approve', 'received', 'completed'].includes(data.kind) || typeof data.id !== 'string' || !/^[0-9a-f]{64}$/.test(data.id)) return { ok: false };
+  if (data.kind !== 'approve') return data.req === null ? { ok: true, kind: data.kind, id: data.id, bytes: null } : { ok: false };
+  const bytes = b64uToBytes(data.req); if (!bytes || !acceptRequestFileBytes(bytes) || (await sha256Of(bytes)) !== data.id) return { ok: false };
+  return { ok: true, kind: 'approve', id: data.id, bytes, req: data.req };
+}
 
 // receipt text -> the fixed return URL. No other destination can be produced.
 export function receiptReturnUrl(receiptText) {
