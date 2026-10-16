@@ -7,7 +7,7 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
-import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES } from './fragment.js?v=3h'; // versioned: a cached v0.3c module would reject the resume path
+import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES } from './fragment.js?v=3i'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const TEST_REPO = 'yuta5150rr/probe';
@@ -562,6 +562,15 @@ async function drainIncoming() {
 }
 function runDeferredIncoming() { if (incomingDeferred) { incomingDeferred = false; return drainIncoming(); } }
 
+// Explicit refresh (the button): same intake as above, but with the stale state cleared BEFORE the I/O and gated against signing / incoming #req races.
+async function refreshFromFixedFile() {
+  if (state.busy) { log('署名などの処理中は読み込み直せない。終わってからもう一度押す', 'bad'); return; }
+  if (incomingRunning) { log('依頼を取り込み中。少し待ってからもう一度押す', 'bad'); return; }
+  incomingRunning = true;
+  try { clearPendingRequest(); setUnsavedMark(false); await intakeFixedFile(true); } finally { incomingRunning = false; }
+  if (incomingDirty || location.hash.startsWith('#req=')) await drainIncoming();
+}
+
 async function redeliverPendingReceipts() {
   const r = await loadReceipts(pendingStorage(), Date.now(), pendingHash);
   for (const d of r.dropped) log('保存した受領書を使わない（' + d.reason + '）', d.reason === 'expired' ? undefined : 'bad');
@@ -629,25 +638,52 @@ async function restoreSavedPending(allowFile, explicit) {
   }
   clearPendingRequest();
   if (r.status === 'signed') { log('保存した依頼は署名済み。再署名はしない。新しい依頼を待つ（古い公開ファイルは自動では読まない）', 'bad'); return; }
-  if (r.status === 'expired') { clearPendingRecord(pendingStorage()); log('保存した依頼は承認の締切（' + r.approve_by + '）を過ぎた。署名できない。新しい依頼が必要', 'bad'); return; }
+  if (r.status === 'expired') {
+    clearPendingRecord(pendingStorage()); log('保存した依頼は承認の締切（' + r.approve_by + '）を過ぎた。署名できない', 'bad');
+    if (allowFile) await loadPendingRequest();   // a newer valid fixed-file target may be picked; the app's strict parse + deadline check still decide (failure/expired => nothing signable)
+    return;
+  }
   if (r.status === 'invalid') { clearPendingRecord(pendingStorage()); log('保存した依頼が正しい形式ではない（' + r.reason + '）。署名を止めた', 'bad'); return; }
   log('この端末の保存領域を読めないため、最新の依頼を確認できない。署名を止めた。「署名待ちの依頼を読み込み直す」で公開ファイルを明示的に読める', 'bad');   // storage-unavailable
 }
 
 // Reads the ONE fixed same-origin file (connect-src 'self'); the app's own strict parseRequest still decides whether it can be signed.
-async function loadPendingRequest() {
-  const r = await loadFixedRequest((u, init) => fetch(u, init));
-  if (r.status === 'none') { clearPendingRequest(); log('署名待ちの依頼は置かれていない'); return; }
-  if (r.status === 'bad') { clearPendingRequest(); log('署名待ちの依頼を読めなかった（' + r.reason + '）', 'bad'); return; }
-  try {
-    await loadRequest(r.bytes);
-    state.imported = true;
-    log('署名待ちの依頼を読み込んだ。機械の値を確かめてから承認する', 'good');
-  } catch (e) {
-    clearPendingRequest();
-    log('署名待ちの依頼を表示できなかった: ' + errText(e), 'bad');
-  }
+// The ONLY path that reads the fixed public file (startup 'none' / 'expired' fallback AND the explicit button). One set of rules for all of it:
+//  fetch (no-store) -> strict canonical acceptance (fragment.js) -> signature state must be KNOWABLE and unsigned -> not older than a newer valid unsigned stored target ->
+//  the app's strict parseRequest + deadline check (loadRequest) -> persist (source 'file') only when signable. Anything else leaves NOTHING signable and never touches the stored state.
+function sameBytes(a, b) { return a.length === b.length && a.every((x, i) => x === b[i]); }
+const TS_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
+function createdMs(bytes) { try { const q = JSON.parse(new TextDecoder().decode(bytes)); return TS_RE.test(q.created_at) ? Date.parse(q.created_at) : NaN; } catch (e) { return NaN; } }
+// -> 'signed' | 'unsigned' | 'unknown'. Unreadable stored state is UNKNOWN (never silently "unsigned").
+async function signedState(bytes) {
+  const p = await readPendingRequest(pendingStorage(), Date.now(), pendingHash);
+  if (p.status === 'storage-unavailable') return 'unknown';
+  if (p.status === 'signed' && p.bytes && sameBytes(p.bytes, bytes)) return 'signed';
+  const r = await loadReceipts(pendingStorage(), Date.now(), pendingHash);
+  if (r.status === 'storage-unavailable') return 'unknown';
+  return r.items.some((it) => sameBytes(it.requestBytes, bytes)) ? 'signed' : 'unsigned';
 }
+async function intakeFixedFile(explicit) {
+  const r = await loadFixedRequest((u, init) => fetch(u, init));
+  if (r.status === 'none') { clearPendingRequest(); log(explicit ? '公開の署名待ちファイルは置かれていない。署名できる依頼はない' : '署名待ちの依頼は置かれていない', explicit ? 'bad' : undefined); return; }
+  if (r.status === 'bad') { clearPendingRequest(); log('公開の署名待ちファイルを読めなかった（' + r.reason + '）。署名を止めた', 'bad'); return; }
+  const sig = await signedState(r.bytes);
+  if (sig === 'unknown') { clearPendingRequest(); log('署名済みかどうかを確認できない（この端末の保存領域を読めない）。署名を止めた。保存済みの依頼と受領書は変えていない', 'bad'); return; }
+  if (sig === 'signed') { clearPendingRequest(); log('公開ファイルの依頼は署名済み。再署名はしない', 'bad'); return; }
+  const stored = await readPendingRequest(pendingStorage(), Date.now(), pendingHash);
+  if (stored.status === 'ok' && !sameBytes(stored.bytes, r.bytes)) {
+    const fc = createdMs(r.bytes), sc = createdMs(stored.bytes);
+    if (!Number.isFinite(fc)) { clearPendingRequest(); log('公開ファイルの依頼の作成時刻を確認できない。署名を止めた', 'bad'); return; }
+    if (Number.isFinite(sc) && fc < sc) { clearPendingRequest(); log('公開ファイルの依頼（' + workIdOf(r.bytes) + '）は、保存済みのより新しい依頼（' + workIdOf(stored.bytes) + '）より古い。署名を止めた。保存済みの依頼は残してある（再読込で復元）', 'bad'); return; }   // equal second = distinct requests: the explicit file intent is followed
+  }
+  try {
+    await loadRequest(r.bytes); state.imported = true;
+    if (state.currentBlock) { log('公開ファイルの依頼は署名できない: ' + state.currentBlock, 'bad'); return; }
+    const sv = savePendingRequest(pendingStorage(), r.bytes, await pendingHash(r.bytes), Date.now(), 'file');
+    log(sv.ok ? '公開ファイルの最新の依頼（' + workIdOf(r.bytes) + '）を読み込み、この端末に保存した。機械の値を確かめてから承認する' : '公開ファイルの最新の依頼（' + workIdOf(r.bytes) + '）を読み込んだが、この端末に保存できなかった（' + sv.reason + '）', sv.ok ? 'good' : 'bad');
+  } catch (e) { clearPendingRequest(); log('公開ファイルの依頼を表示できなかった（署名は止めた）: ' + errText(e), 'bad'); }
+}
+async function loadPendingRequest() { await intakeFixedFile(false); }
 
 function onSaveReceipt() {
   if (state.receiptText) saveFile(state.receiptName, state.receiptText);
@@ -703,7 +739,7 @@ async function initInner() {
   reload.type = 'button';
   reload.id = 'btn-reload-pending';
   reload.textContent = '署名待ちの依頼を読み込み直す';
-  reload.addEventListener('click', () => { if (!state.busy) { const s = pendingStorage(); readPendingRequest(s, Date.now(), pendingHash).then((r) => { if (r.status === 'storage-unavailable') { setUnsavedMark(false); return loadPendingRequest(); } if (r.status === 'signed') { clearPendingRecord(s); setUnsavedMark(false); return loadPendingRequest(); } return restoreSavedPending(true, true); }); } });
+  reload.addEventListener('click', () => { refreshFromFixedFile(); });
   $('btn-test-request').before(reload, document.createElement('br'));
   await startupLoad();
   if (!isStandalone()) log('ホーム画面アプリではない。セットアップは「ホーム画面に追加」した方で行う。');

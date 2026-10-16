@@ -1,4 +1,4 @@
-// fragment.js (v0.3h: no lossy outbox) (v0.3g: durable signed receipt) (v0.3f: durable pending request) (v0.3d: + dot-probe/claude-resume-readonly) - pure helpers for the one-request transport. No DOM, no storage, no crypto, no network of its own:
+// fragment.js (v0.3i: source 'file' for an explicit fixed-file refresh) (v0.3h: no lossy outbox) (v0.3g: durable signed receipt) (v0.3f: durable pending request) (v0.3d: + dot-probe/claude-resume-readonly) - pure helpers for the one-request transport. No DOM, no storage, no crypto, no network of its own:
 // the caller passes the fetch function and this module only ever hands it ONE fixed same-origin path.
 // IN : the exact request bytes the Sites authority issued, placed at ONE fixed same-origin file (public data only: no secret/receipt/token).
 // OUT: top-level navigation to ONE fixed Sites page with the receipt in the URL fragment (never sent to a server by the browser).
@@ -97,7 +97,7 @@ export async function readPendingRequest(storage, nowMs, sha256Of) {
   if (raw === null || raw === undefined) return { status: 'none' };
   let rec; try { rec = JSON.parse(raw); } catch (e) { return { status: 'invalid', reason: 'not json' }; }
   if (!rec || typeof rec !== 'object' || Array.isArray(rec) || Object.keys(rec).sort().join() !== PENDING_KEYS.split(',').sort().join() || rec.v !== 1) return { status: 'invalid', reason: 'shape' };
-  if (rec.source !== 'fragment' || typeof rec.signed !== 'boolean' || !Number.isFinite(rec.saved_ms) || rec.saved_ms > nowMs + SKEW_MS || typeof rec.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(rec.sha256)) return { status: 'invalid', reason: 'fields' };
+  if (!['fragment', 'file'].includes(rec.source) || typeof rec.signed !== 'boolean' || !Number.isFinite(rec.saved_ms) || rec.saved_ms > nowMs + SKEW_MS || typeof rec.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(rec.sha256)) return { status: 'invalid', reason: 'fields' };
   const bytes = b64uToBytes(rec.request_b64u);
   if (!bytes) return { status: 'invalid', reason: 'encoding' };
   if (!acceptRequestFileBytes(bytes)) return { status: 'invalid', reason: 'not a fixed canonical request' };      // strict canonical bytes, fixed repo, allowed path only
