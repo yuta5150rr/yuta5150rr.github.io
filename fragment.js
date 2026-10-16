@@ -1,4 +1,4 @@
-// fragment.js (v0.3d: + dot-probe/claude-resume-readonly) - pure helpers for the one-request transport. No DOM, no storage, no crypto, no network of its own:
+// fragment.js (v0.3h: no lossy outbox) (v0.3g: durable signed receipt) (v0.3f: durable pending request) (v0.3d: + dot-probe/claude-resume-readonly) - pure helpers for the one-request transport. No DOM, no storage, no crypto, no network of its own:
 // the caller passes the fetch function and this module only ever hands it ONE fixed same-origin path.
 // IN : the exact request bytes the Sites authority issued, placed at ONE fixed same-origin file (public data only: no secret/receipt/token).
 // OUT: top-level navigation to ONE fixed Sites page with the receipt in the URL fragment (never sent to a server by the browser).
@@ -70,6 +70,125 @@ export function requestFromFragment(hash) {
   if (bytesToB64u(bytes) !== m[1]) return null;
   return acceptRequestFileBytes(bytes);
 }
+
+// ---- durable pending request (v0.3f) ----
+// A request imported from the owner's Site (#req=...) is kept as its EXACT bytes in scoped, non-credential browser storage so a reload / iOS suspension
+// restores the SAME target instead of re-fetching the (older) public fixed file. Nothing here touches keys, crypto, core or the network.
+export const PENDING_KEY = 'xgate-pending-request/v1';
+const PENDING_KEYS = 'v,request_b64u,sha256,saved_ms,source,signed';
+const TS = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
+const SKEW_MS = 5 * 60 * 1000;
+function b64uToBytes(s) {
+  if (typeof s !== 'string' || !/^[A-Za-z0-9_-]+$/.test(s) || s.length % 4 === 1) return null;
+  let bin; try { bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4)); } catch (e) { return null; }
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return bytesToB64u(bytes) === s ? bytes : null;
+}
+export function savePendingRequest(storage, bytes, sha256Hex, nowMs, source) {
+  if (!storage || !acceptRequestFileBytes(bytes)) return { ok: false, reason: 'not-storable' };
+  try { storage.setItem(PENDING_KEY, JSON.stringify({ v: 1, request_b64u: bytesToB64u(bytes), sha256: sha256Hex, saved_ms: nowMs, source, signed: false })); } catch (e) { return { ok: false, reason: 'storage-failed' }; }
+  return { ok: true };
+}
+export function clearPendingRecord(storage) { try { storage && storage.removeItem(PENDING_KEY); return true; } catch (e) { return false; } }
+// -> { status: 'none' | 'ok' | 'signed' | 'expired' | 'invalid' | 'storage-unavailable', bytes?, reason? }. Anything doubtful is NOT 'ok'.
+export async function readPendingRequest(storage, nowMs, sha256Of) {
+  if (!storage) return { status: 'storage-unavailable', reason: 'no storage' };
+  let raw; try { raw = storage.getItem(PENDING_KEY); } catch (e) { return { status: 'storage-unavailable', reason: 'read failed' }; }
+  if (raw === null || raw === undefined) return { status: 'none' };
+  let rec; try { rec = JSON.parse(raw); } catch (e) { return { status: 'invalid', reason: 'not json' }; }
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec) || Object.keys(rec).sort().join() !== PENDING_KEYS.split(',').sort().join() || rec.v !== 1) return { status: 'invalid', reason: 'shape' };
+  if (rec.source !== 'fragment' || typeof rec.signed !== 'boolean' || !Number.isFinite(rec.saved_ms) || rec.saved_ms > nowMs + SKEW_MS || typeof rec.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(rec.sha256)) return { status: 'invalid', reason: 'fields' };
+  const bytes = b64uToBytes(rec.request_b64u);
+  if (!bytes) return { status: 'invalid', reason: 'encoding' };
+  if (!acceptRequestFileBytes(bytes)) return { status: 'invalid', reason: 'not a fixed canonical request' };      // strict canonical bytes, fixed repo, allowed path only
+  if ((await sha256Of(bytes)) !== rec.sha256) return { status: 'invalid', reason: 'hash mismatch' };
+  let q; try { q = JSON.parse(new TextDecoder().decode(bytes)); } catch (e) { return { status: 'invalid', reason: 'json' }; }
+  if (!TS.test(q.approve_by) || !TS.test(q.verify_by) || !TS.test(q.created_at)) return { status: 'invalid', reason: 'timestamps' };
+  const approveBy = Date.parse(q.approve_by);
+  if (rec.signed) return { status: 'signed', bytes };
+  if (nowMs >= approveBy) return { status: 'expired', reason: 'approve_by passed', approve_by: q.approve_by };
+  return { status: 'ok', bytes, record: rec };
+}
+// marks the stored record signed ONLY if it still holds exactly these bytes
+export function markPendingSigned(storage, bytes) {
+  try {
+    const raw = storage.getItem(PENDING_KEY); if (!raw) return false;
+    const rec = JSON.parse(raw); if (!rec || rec.request_b64u !== bytesToB64u(bytes)) return false;
+    rec.signed = true; storage.setItem(PENDING_KEY, JSON.stringify(rec)); return true;
+  } catch (e) { return false; }
+}
+
+// ---- durable signed receipt (v0.3g) ----
+// The EXACT serialized receipt is stored, bound to the exact request bytes it signs, BEFORE any navigation, so a reload / suspension between
+// serializeReceipt and the Site ingesting the fragment cannot lose the signature. Redelivery sends the same bytes to the ONE fixed Site URL;
+// no new signature, no new nonce, no key material here. A receipt is dropped once its request's approve_by has passed (deadlines are never extended).
+export const RECEIPT_KEY = 'xgate-pending-receipt/v1';
+export const MAX_RECEIPT_BYTES = MAX_FRAGMENT_RECEIPT_BYTES;
+export const MAX_RECEIPT_ITEMS = 3;
+export const MAX_AUTO_REDELIVERIES = 5;
+const ITEM_KEYS = 'id,request_b64u,receipt_text,receipt_sha256,saved_ms,approve_by_ms,attempts';
+// receiptText must be canonical-shaped and its `request` must decode to EXACTLY requestBytes; -> { ok, approveByMs } | { ok:false, reason }
+function checkReceiptBinding(requestBytes, receiptText) {
+  if (typeof receiptText !== 'string') return { ok: false, reason: 'not-text' };
+  const rb = new TextEncoder().encode(receiptText);
+  if (rb.length < 2 || rb.length > MAX_RECEIPT_BYTES) return { ok: false, reason: 'size' };
+  let r; try { r = JSON.parse(receiptText); } catch (e) { return { ok: false, reason: 'not-json' }; }
+  if (!r || typeof r !== 'object' || Array.isArray(r) || Object.keys(r).sort().join() !== 'device,passkey,request,v' || r.v !== 1) return { ok: false, reason: 'shape' };
+  const bound = b64uToBytes(r.request);
+  if (!bound || bound.length !== requestBytes.length || !bound.every((x, i) => x === requestBytes[i])) return { ok: false, reason: 'request-mismatch' };
+  if (!acceptRequestFileBytes(requestBytes)) return { ok: false, reason: 'request-not-allowed' };
+  let q; try { q = JSON.parse(new TextDecoder().decode(requestBytes)); } catch (e) { return { ok: false, reason: 'request-json' }; }
+  const ap = TS.test(q.approve_by) ? Date.parse(q.approve_by) : NaN;
+  if (!Number.isFinite(ap)) return { ok: false, reason: 'request-timestamps' };
+  return { ok: true, approveByMs: ap };
+}
+function readReceiptItems(storage) { // -> array (possibly empty) | null when storage is unusable
+  if (!storage) return null;
+  let raw; try { raw = storage.getItem(RECEIPT_KEY); } catch (e) { return null; }
+  if (raw === null || raw === undefined) return [];
+  try { const j = JSON.parse(raw); return j && j.v === 1 && Array.isArray(j.items) ? j.items : []; } catch (e) { return []; }
+}
+function writeReceiptItems(storage, items) {
+  try { if (items.length) storage.setItem(RECEIPT_KEY, JSON.stringify({ v: 1, items })); else storage.removeItem(RECEIPT_KEY); return true; } catch (e) { return false; }
+}
+// sha256Hex of the receipt text bytes is supplied by the caller (WebCrypto lives in the app). -> { ok } | { ok:false, reason }
+export function saveReceipt(storage, requestBytes, receiptText, receiptSha256, nowMs) {
+  const b = checkReceiptBinding(requestBytes, receiptText);
+  if (!b.ok) return { ok: false, reason: b.reason };
+  if (typeof receiptSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(receiptSha256)) return { ok: false, reason: 'hash' };
+  const cur = readReceiptItems(storage); if (cur === null) return { ok: false, reason: 'storage-failed' };
+  // Bounded outbox, never lossy: expired items can no longer be accepted by the Site and may go; an undelivered signed receipt is NEVER evicted.
+  const live = cur.filter((x) => x && Number.isFinite(x.approve_by_ms) && x.approve_by_ms > nowMs);
+  if (!live.some((x) => x.id === receiptSha256.slice(0, 16)) && live.length >= MAX_RECEIPT_ITEMS) return { ok: false, reason: 'outbox-full' };
+  const item = { id: receiptSha256.slice(0, 16), request_b64u: bytesToB64u(requestBytes), receipt_text: receiptText, receipt_sha256: receiptSha256, saved_ms: nowMs, approve_by_ms: b.approveByMs, attempts: 0 };
+  const items = [...live.filter((x) => x.id !== item.id), item];
+  return writeReceiptItems(storage, items) ? { ok: true, id: item.id } : { ok: false, reason: 'storage-failed' };
+}
+// -> { status: 'none'|'ok'|'storage-unavailable', items: [{ id, requestBytes, receiptText, attempts, approveByMs }], dropped: [{ id, reason }] }
+// Every item is re-validated (shape, size, hash, binding to its request, allowed path, deadline). Invalid / expired items are dropped from storage, never delivered.
+export async function loadReceipts(storage, nowMs, sha256Of) {
+  const raw = readReceiptItems(storage); if (raw === null) return { status: 'storage-unavailable', items: [], dropped: [] };
+  const keep = [], items = [], dropped = [];
+  for (const it of raw) {
+    const id = it && typeof it.id === 'string' ? it.id : '?';
+    try {
+      if (!it || typeof it !== 'object' || Array.isArray(it) || Object.keys(it).sort().join() !== ITEM_KEYS.split(',').sort().join()) { dropped.push({ id, reason: 'shape' }); continue; }
+      const requestBytes = b64uToBytes(it.request_b64u); if (!requestBytes) { dropped.push({ id, reason: 'encoding' }); continue; }
+      const b = checkReceiptBinding(requestBytes, it.receipt_text); if (!b.ok) { dropped.push({ id, reason: b.reason }); continue; }
+      if (typeof it.receipt_sha256 !== 'string' || (await sha256Of(new TextEncoder().encode(it.receipt_text))) !== it.receipt_sha256 || it.id !== it.receipt_sha256.slice(0, 16)) { dropped.push({ id, reason: 'hash-mismatch' }); continue; }
+      if (it.approve_by_ms !== b.approveByMs || !Number.isInteger(it.attempts) || it.attempts < 0 || it.attempts > 99 || !Number.isFinite(it.saved_ms) || it.saved_ms > nowMs + SKEW_MS) { dropped.push({ id, reason: 'fields' }); continue; }
+      if (nowMs >= b.approveByMs) { dropped.push({ id, reason: 'expired' }); continue; }
+      keep.push(it); items.push({ id: it.id, requestBytes, receiptText: it.receipt_text, attempts: it.attempts, approveByMs: b.approveByMs });
+    } catch (e) { dropped.push({ id, reason: 'error' }); }
+  }
+  if (dropped.length) writeReceiptItems(storage, keep);
+  return { status: items.length ? 'ok' : 'none', items, dropped };
+}
+export function noteReceiptAttempt(storage, id) {
+  const cur = readReceiptItems(storage); if (cur === null) return false;
+  return writeReceiptItems(storage, cur.map((x) => (x && x.id === id ? { ...x, attempts: Math.min(99, (x.attempts | 0) + 1) } : x)));
+}
+export function clearReceipt(storage, id) { const cur = readReceiptItems(storage); return cur === null ? false : writeReceiptItems(storage, cur.filter((x) => !(x && x.id === id))); }
 
 // receipt text -> the fixed return URL. No other destination can be produced.
 export function receiptReturnUrl(receiptText) {

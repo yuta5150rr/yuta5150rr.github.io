@@ -7,7 +7,7 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
-import { loadFixedRequest, receiptReturnUrl, requestFromFragment } from './fragment.js?v=3e'; // versioned: a cached v0.3c module would reject the resume path
+import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES } from './fragment.js?v=3h'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const TEST_REPO = 'yuta5150rr/probe';
@@ -470,6 +470,7 @@ function onApprove() {
       requestBytes: cur.bytes, credentialId, authenticatorData, clientDataJSON, passkeySignature, deviceSignature,
     });
     state.receiptName = 'receipt-' + cur.request.work_id + '.json';
+    await persistSignedReceipt(cur);   // BEFORE any navigation: exact receipt, bound to this request, durable; the target is marked signed (never offered again)
     log('受領書を作った（' + cur.request.work_id + '）。「受領書を保存」で渡す', 'good');
     if (state.imported) returnToSites();
   }).catch((e) => log('承認できなかった: ' + errText(e), 'bad'))
@@ -477,9 +478,16 @@ function onApprove() {
 }
 
 // One-way return: top-level navigation to ONE fixed Sites page, receipt in the fragment. No return trip to this app is needed.
-function returnToSites() {
+// Interrupt point: a reload right after this returns (before location.assign) must still be able to re-deliver the exact signed receipt.
+async function persistSignedReceipt(cur) {
+  const kept = saveReceipt(pendingStorage(), cur.bytes, state.receiptText, await pendingHash(utf8(state.receiptText)), Date.now());
+  markPendingSigned(pendingStorage(), cur.bytes);
+  if (!kept.ok) log('受領書をこの端末に保存できなかった（' + kept.reason + '）。' + (kept.reason === 'outbox-full' ? '未返送の署名済み受領書が上限まで残っている（消さずに保持）。先にそれらを返す。' : '') + 'Siteへ返す前に閉じると失われる。すぐに「Sitesへ受領書を返す」を押す', 'bad');
+  return kept;
+}
+function prepareReturnLink() {
   const url = state.receiptText ? receiptReturnUrl(state.receiptText) : null;
-  if (!url) { log('Sitesへ返せる形ではない（受領書を保存で渡す）', 'bad'); return; }
+  if (!url) return null;
   let a = $('lnk-return');
   if (!a) {
     a = document.createElement('a');
@@ -489,8 +497,57 @@ function returnToSites() {
     $('btn-save-receipt').after(a);
   }
   a.href = url;
+  return url;
+}
+function returnToSites() {
+  const url = prepareReturnLink();
+  if (!url) { log('Sitesへ返せる形ではない（受領書を保存で渡す）', 'bad'); return; }
   log('Sitesへ自動で返す。進まない時は「Sitesへ受領書を返す」を押す', 'good');
   location.assign(url);
+}
+
+// Re-delivers the stored signed receipt(s), byte for byte, to the ONE fixed Site URL. Same bytes -> the Site is idempotent; no new signature is ever made.
+// Automatic navigation is bounded (MAX_AUTO_REDELIVERIES per receipt); after that only the explicit link remains. Expired / invalid items were dropped by loadReceipts.
+// Startup. The #req fragment is scrubbed ONLY after its exact bytes are durably saved (or when it cannot be used at all);
+// if saving failed the original fragment stays in the URL, so a reload re-imports the very same target instead of falling back to the old public file.
+async function startupLoad() {
+  const fromHash = requestFromFragment(location.hash);
+  const hadFragment = location.hash.startsWith('#req=');
+  if (fromHash) {
+    const out = await loadRequestFromFragment(fromHash);
+    if (out.saved || !out.shown) history.replaceState(null, '', location.pathname + location.search);
+  } else if (hadFragment) {
+    history.replaceState(null, '', location.pathname + location.search);       // unusable fragment: nothing to keep
+    log('Siteから受け取った依頼が正しい形式ではなかった。保存済みの依頼があればそれを使う', 'bad'); await restoreSavedPending(false, false);
+  } else await restoreSavedPending(true, false);
+  await redeliverPendingReceipts();
+}
+
+// An unrelated old receipt is NEVER auto-delivered over a target the user is looking at: automatic re-delivery is only for the receipt that matches the
+// signed stored target while nothing else is shown. Every other undelivered receipt stays stored and is offered as an explicit recovery link.
+function offerRecoveryLink(item) {
+  let a = $('lnk-recover-' + item.id);
+  if (!a) { a = document.createElement('a'); a.id = 'lnk-recover-' + item.id; a.rel = 'noreferrer'; $('btn-save-receipt').after(a); }
+  a.textContent = '署名済みで未返送の前の受領書をSiteへ返す（' + item.id.slice(0, 8) + '）';
+  a.href = receiptReturnUrl(item.receiptText);
+  a.onclick = () => { noteReceiptAttempt(pendingStorage(), item.id); };
+}
+async function redeliverPendingReceipts() {
+  const r = await loadReceipts(pendingStorage(), Date.now(), pendingHash);
+  for (const d of r.dropped) log('保存した受領書を使わない（' + d.reason + '）', d.reason === 'expired' ? undefined : 'bad');
+  if (r.status === 'storage-unavailable') { log('保存した受領書を確認できない（保存領域を読めない）。署名済みの受領書が残っていても再送できない', 'bad'); return; }
+  if (!r.items.length) return;
+  const signed = state.current ? null : await readPendingRequest(pendingStorage(), Date.now(), pendingHash);
+  const same = (b) => signed && signed.status === 'signed' && signed.bytes && signed.bytes.length === b.length && signed.bytes.every((x, i) => x === b[i]);
+  const auto = r.items.find((it) => same(it.requestBytes) && it.attempts < MAX_AUTO_REDELIVERIES);
+  for (const it of r.items) if (it !== auto) offerRecoveryLink(it);
+  const others = r.items.filter((it) => it !== auto).length;
+  if (others) log('署名済みで未返送の前の受領書が' + others + '件ある（保持している）。現在の依頼はそのまま。必要なら表示のリンクから返す', 'bad');
+  if (!auto) return;
+  state.receiptText = auto.receiptText; state.receiptName = 'receipt-redelivery.json';
+  noteReceiptAttempt(pendingStorage(), auto.id);
+  log('署名済みの受領書がまだSiteへ返っていない可能性がある。同じ受領書を再送する（新しい署名はしない）', 'good');
+  returnToSites();
 }
 
 // Drops everything a previously shown request left behind and redraws, so a stale request can never stay signable.
@@ -504,15 +561,46 @@ function clearPendingRequest() {
 }
 
 // A request handed over by the owner's private Site (/pending) in the URL fragment; the app's own strict parseRequest still decides whether it can be signed.
+function pendingStorage() { try { return window.localStorage; } catch (e) { return null; } }
+async function pendingHash(bytes) { return toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); }
 async function loadRequestFromFragment(bytes) {
+  const saved = savePendingRequest(pendingStorage(), bytes, await pendingHash(bytes), Date.now(), 'fragment');
   try {
     await loadRequest(bytes);
     state.imported = true;
-    log('Siteから署名待ちの依頼を受け取った。機械の値を確かめてから承認する', 'good');
+    if (saved.ok) { setUnsavedMark(false); log('Siteから署名待ちの依頼を受け取り、この端末に保存した。機械の値を確かめてから承認する', 'good'); }
+    else { setUnsavedMark(true); log('Siteから署名待ちの依頼を受け取ったが、この端末に保存できなかった（' + saved.reason + '）。URLの依頼は消さずに残す（再読込しても同じ依頼を読み直す）。古い公開ファイルは自動では読まない。機械の値を確かめてから承認する', 'bad'); }
+    return { shown: true, saved: saved.ok };
   } catch (e) {
+    clearPendingRecord(pendingStorage());
     clearPendingRequest();
     log('Siteから受け取った依頼を表示できなかった: ' + errText(e), 'bad');
+    return { shown: false, saved: false };
   }
+}
+
+// Restores the stored target (reload / suspension). The public fixed file is read ONLY when nothing was ever imported
+// (or on the explicit button when nothing is stored) - never in the background behind a newer imported target.
+const UNSAVED_MARK = 'xgate-unsaved-import';
+function unsavedMarked() { try { return window.name === UNSAVED_MARK; } catch (e) { return false; } }
+function setUnsavedMark(on) { try { window.name = on ? UNSAVED_MARK : ''; } catch (e) { /* best effort; the on-screen warning is the primary signal */ } }
+async function restoreSavedPending(allowFile, explicit) {
+  const r = await readPendingRequest(pendingStorage(), Date.now(), pendingHash);
+  if (r.status === 'ok') {
+    try { await loadRequest(r.bytes); state.imported = true; log('この端末に保存した署名待ちの依頼を復元した。機械の値を確かめてから承認する', 'good'); }
+    catch (e) { clearPendingRequest(); log('保存した依頼を表示できなかった（署名は止めた）: ' + errText(e), 'bad'); }
+    return;
+  }
+  if (r.status === 'none') {
+    if (!explicit && unsavedMarked()) { clearPendingRequest(); log('保存できなかった依頼を受け取った後に再読込された。最新の依頼を確認できないため署名を止めた（古い公開ファイルは自動では読まない）。新しい依頼を開き直すか、読み込み直しを押す', 'bad'); return; }
+    if (allowFile) { setUnsavedMark(false); await loadPendingRequest(); } else { clearPendingRequest(); log('署名待ちの依頼は保存されていない'); }
+    return;
+  }
+  clearPendingRequest();
+  if (r.status === 'signed') { log('保存した依頼は署名済み。再署名はしない。新しい依頼を待つ（古い公開ファイルは自動では読まない）', 'bad'); return; }
+  if (r.status === 'expired') { clearPendingRecord(pendingStorage()); log('保存した依頼は承認の締切（' + r.approve_by + '）を過ぎた。署名できない。新しい依頼が必要', 'bad'); return; }
+  if (r.status === 'invalid') { clearPendingRecord(pendingStorage()); log('保存した依頼が正しい形式ではない（' + r.reason + '）。署名を止めた', 'bad'); return; }
+  log('この端末の保存領域を読めないため、最新の依頼を確認できない。署名を止めた。「署名待ちの依頼を読み込み直す」で公開ファイルを明示的に読める', 'bad');   // storage-unavailable
 }
 
 // Reads the ONE fixed same-origin file (connect-src 'self'); the app's own strict parseRequest still decides whether it can be signed.
@@ -575,11 +663,9 @@ async function init() {
   reload.type = 'button';
   reload.id = 'btn-reload-pending';
   reload.textContent = '署名待ちの依頼を読み込み直す';
-  reload.addEventListener('click', () => { if (!state.busy) loadPendingRequest(); });
+  reload.addEventListener('click', () => { if (!state.busy) { const s = pendingStorage(); readPendingRequest(s, Date.now(), pendingHash).then((r) => { if (r.status === 'storage-unavailable') { setUnsavedMark(false); return loadPendingRequest(); } if (r.status === 'signed') { clearPendingRecord(s); setUnsavedMark(false); return loadPendingRequest(); } return restoreSavedPending(true, true); }); } });
   $('btn-test-request').before(reload, document.createElement('br'));
-  const fromHash = requestFromFragment(location.hash);
-  if (location.hash.startsWith('#req=')) history.replaceState(null, '', location.pathname + location.search); // the fragment is single-use
-  if (fromHash) await loadRequestFromFragment(fromHash); else await loadPendingRequest();
+  await startupLoad();
   if (!isStandalone()) log('ホーム画面アプリではない。セットアップは「ホーム画面に追加」した方で行う。');
 }
 
