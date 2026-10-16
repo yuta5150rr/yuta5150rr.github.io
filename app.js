@@ -7,6 +7,7 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
+import { loadFixedRequest, receiptReturnUrl } from './fragment.js';
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const TEST_REPO = 'yuta5150rr/probe';
@@ -25,6 +26,7 @@ const state = {
   currentBlock: null,
   receiptText: null,
   receiptName: null,
+  imported: false,         // true only when the shown request came from the fixed same-origin request file
   busy: false,
 };
 
@@ -379,6 +381,7 @@ async function loadRequest(bytes) {
   state.current = null;
   state.currentBlock = null;
   state.receiptText = null;
+  state.imported = false;
   const request = parseRequest(bytes); // strict: unknown/duplicate keys, bad characters, bad paths all throw
   const challenge = await sha256(challengeMessage(bytes));
   state.current = { bytes, request, challenge };
@@ -468,8 +471,40 @@ function onApprove() {
     });
     state.receiptName = 'receipt-' + cur.request.work_id + '.json';
     log('受領書を作った（' + cur.request.work_id + '）。「受領書を保存」で渡す', 'good');
+    if (state.imported) returnToSites();
   }).catch((e) => log('承認できなかった: ' + errText(e), 'bad'))
     .finally(() => { state.busy = false; renderStatus(); });
+}
+
+// One-way return: top-level navigation to ONE fixed Sites page, receipt in the fragment. No return trip to this app is needed.
+function returnToSites() {
+  const url = state.receiptText ? receiptReturnUrl(state.receiptText) : null;
+  if (!url) { log('Sitesへ返せる形ではない（受領書を保存で渡す）', 'bad'); return; }
+  let a = $('lnk-return');
+  if (!a) {
+    a = document.createElement('a');
+    a.id = 'lnk-return';
+    a.rel = 'noreferrer';
+    a.textContent = 'Sitesへ受領書を返す';
+    $('btn-save-receipt').after(a);
+  }
+  a.href = url;
+  log('Sitesへ自動で返す。進まない時は「Sitesへ受領書を返す」を押す', 'good');
+  location.assign(url);
+}
+
+// Reads the ONE fixed same-origin file (connect-src 'self'); the app's own strict parseRequest still decides whether it can be signed.
+async function loadPendingRequest() {
+  const r = await loadFixedRequest((u, init) => fetch(u, init));
+  if (r.status === 'none') { log('署名待ちの依頼は置かれていない'); return; }
+  if (r.status === 'bad') { log('署名待ちの依頼を読めなかった（' + r.reason + '）', 'bad'); return; }
+  try {
+    await loadRequest(r.bytes);
+    state.imported = true;
+    log('署名待ちの依頼を読み込んだ。機械の値を確かめてから承認する', 'good');
+  } catch (e) {
+    log('署名待ちの依頼を表示できなかった: ' + errText(e), 'bad');
+  }
 }
 
 function onSaveReceipt() {
@@ -513,6 +548,13 @@ async function init() {
   }
   await loadPublished();
   await renderStatus();
+  const reload = document.createElement('button');
+  reload.type = 'button';
+  reload.id = 'btn-reload-pending';
+  reload.textContent = '署名待ちの依頼を読み込み直す';
+  reload.addEventListener('click', () => { if (!state.busy) loadPendingRequest(); });
+  $('btn-test-request').before(reload, document.createElement('br'));
+  await loadPendingRequest();
   if (!isStandalone()) log('ホーム画面アプリではない。セットアップは「ホーム画面に追加」した方で行う。');
 }
 
