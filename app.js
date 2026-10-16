@@ -7,7 +7,7 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
-import { loadFixedRequest, receiptReturnUrl } from './fragment.js';
+import { loadFixedRequest, receiptReturnUrl } from './fragment.js?v=3d'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const TEST_REPO = 'yuta5150rr/probe';
@@ -493,16 +493,27 @@ function returnToSites() {
   location.assign(url);
 }
 
+// Drops everything a previously shown request left behind and redraws, so a stale request can never stay signable.
+function clearPendingRequest() {
+  state.current = null;
+  state.currentBlock = null;
+  state.receiptText = null;
+  state.imported = false;
+  renderRequest();
+  renderStatus().catch(() => {});
+}
+
 // Reads the ONE fixed same-origin file (connect-src 'self'); the app's own strict parseRequest still decides whether it can be signed.
 async function loadPendingRequest() {
   const r = await loadFixedRequest((u, init) => fetch(u, init));
-  if (r.status === 'none') { log('署名待ちの依頼は置かれていない'); return; }
-  if (r.status === 'bad') { log('署名待ちの依頼を読めなかった（' + r.reason + '）', 'bad'); return; }
+  if (r.status === 'none') { clearPendingRequest(); log('署名待ちの依頼は置かれていない'); return; }
+  if (r.status === 'bad') { clearPendingRequest(); log('署名待ちの依頼を読めなかった（' + r.reason + '）', 'bad'); return; }
   try {
     await loadRequest(r.bytes);
     state.imported = true;
     log('署名待ちの依頼を読み込んだ。機械の値を確かめてから承認する', 'good');
   } catch (e) {
+    clearPendingRequest();
     log('署名待ちの依頼を表示できなかった: ' + errText(e), 'bad');
   }
 }
