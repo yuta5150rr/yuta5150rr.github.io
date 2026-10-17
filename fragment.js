@@ -1,4 +1,4 @@
-// fragment.js (v0.3j: + dot-probe/chief-development-v1) (v0.3i: source 'file' for an explicit fixed-file refresh) (v0.3h: no lossy outbox) (v0.3g: durable signed receipt) (v0.3f: durable pending request) (v0.3d: + dot-probe/claude-resume-readonly) - pure helpers for the one-request transport. No DOM, no storage, no crypto, no network of its own:
+// fragment.js (v0.3k: + dot-probe/chief-recovery-v1) (v0.3j: + dot-probe/chief-development-v1) (v0.3i: source 'file' for an explicit fixed-file refresh) (v0.3h: no lossy outbox) (v0.3g: durable signed receipt) (v0.3f: durable pending request) (v0.3d: + dot-probe/claude-resume-readonly) - pure helpers for the one-request transport. No DOM, no storage, no crypto, no network of its own:
 // the caller passes the fetch function and this module only ever hands it ONE fixed same-origin path.
 // IN : the exact request bytes the Sites authority issued, placed at ONE fixed same-origin file (public data only: no secret/receipt/token).
 // OUT: top-level navigation to ONE fixed Sites page with the receipt in the URL fragment (never sent to a server by the browser).
@@ -6,7 +6,7 @@ export const SITES_ORIGIN = 'https://xgate-connector.tainakaritsu903729.chatgpt.
 export const RECEIPT_URL = SITES_ORIGIN + '/receipt';
 export const REQUEST_FILE = 'dotprobe-request.json';
 export const FIXED_REPO = 'yuta5150rr/dot-probe';
-export const FIXED_PATHS = Object.freeze(['dot-probe/readonly-status-check', 'dot-probe/enroll-key-binding', 'dot-probe/claude-resume-readonly', 'dot-probe/flex-readonly-report', 'dot-probe/chief-development-v1']);
+export const FIXED_PATHS = Object.freeze(['dot-probe/readonly-status-check', 'dot-probe/enroll-key-binding', 'dot-probe/claude-resume-readonly', 'dot-probe/flex-readonly-report', 'dot-probe/chief-development-v1', 'dot-probe/chief-recovery-v1']);
 export const MAX_REQUEST_BYTES = 16384;
 const MAX_FRAGMENT_RECEIPT_BYTES = 65536;
 
