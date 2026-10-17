@@ -7,7 +7,7 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
-import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3l'; // versioned: a cached v0.3c module would reject the resume path
+import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3m'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const TEST_REPO = 'yuta5150rr/probe';
