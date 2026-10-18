@@ -12,13 +12,15 @@ const TEXTS = {
 };
 const GENERIC = ['確認があります', 'アプリを開いて確認してください。'];
 const HEX64 = /^[0-9a-f]{64}$/;
+// carried request cap (bytes). 2400 B -> payload 3324 B < the Site's 3500 B payload cap < 3993 B (4096 - 86 header - 17 delimiter/tag). MUST equal the Site's MAX_REQ_BYTES.
+const MAX_REQ_BYTES = 2400;
 const unb64u = (s) => { if (typeof s !== 'string' || !/^[A-Za-z0-9_-]*$/.test(s) || s.length % 4 === 1) return null; const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4)); const u = Uint8Array.from(bin, (c) => c.charCodeAt(0)); return btoa(String.fromCharCode.apply(null, u)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') === s ? u : null; };
 const sha256Hex = async (u8) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', u8)), (x) => x.toString(16).padStart(2, '0')).join('');
 // -> { ok, kind, id, req } | { ok:false }
 async function parse(o) {
   if (!o || typeof o !== 'object' || Array.isArray(o) || o.v !== 1 && o.v !== undefined) return { ok: false };
   if (!KINDS.includes(o.kind) || typeof o.id !== 'string' || !HEX64.test(o.id)) return { ok: false };
-  if (o.kind === 'approve') { const b = unb64u(o.req); if (!b || b.length > 2000 || (await sha256Hex(b)) !== o.id) return { ok: false }; return { ok: true, kind: o.kind, id: o.id, req: o.req }; }
+  if (o.kind === 'approve') { const b = unb64u(o.req); if (!b || b.length > MAX_REQ_BYTES || (await sha256Hex(b)) !== o.id) return { ok: false }; return { ok: true, kind: o.kind, id: o.id, req: o.req }; }
   if (o.req !== undefined && o.req !== null) return { ok: false };
   return { ok: true, kind: o.kind, id: o.id, req: null };
 }
