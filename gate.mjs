@@ -17,7 +17,9 @@ import { createHash, createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { FormatError, b64uEncode, utf8 } from './core.js';
+import { FormatError, b64uEncode, utf8, parseReceipt, parseRequest } from './core.js';
+import { buildManifest, manifestDigest } from './manifest.mjs';
+import { makeClaimClient, actionsIdToken } from './claim-client.mjs';
 import { verifyReceipt } from './verify.mjs';
 import {
   STATUS_CONTEXT, MAIN_REF, SHA_RE, REPO_RE, MAX_RECEIPT_BLOB_BYTES,
@@ -71,6 +73,30 @@ function makeApi(base, fetchImpl, sleep) {
 }
 
 // The bytes of a blob, checked against its git object id (so they are exactly the tree's entry).
+const README_REPO = 'yuta5150rr/autonomy-daemon', MAX_CONTENT_BYTES = 1048576;
+const README_TITLE = 'リポジトリ ' + README_REPO + ' の README.md だけを変更するPRを、1回だけ承認する（他のファイル・workflow・設定は対象外）';
+const PARSE_RE = /対象: .+ のPR#([1-9][0-9]{0,8})（mainのbase SHA ([0-9a-f]{40})）の、.*変更manifest SHA-256 ([0-9a-f]{64}) に一致/;
+const readmeSummary = (digest, pr, base) => '許可する操作はこの1件だけ。対象: ' + README_REPO + ' のPR#' + pr + '（mainのbase SHA ' + base + '）の、README.md の内容変更を含むPR（受領書 approvals/<work_id>.json を同じPRに載せる）を、承認ゲートが通してよい。承認する変更内容は、変更manifest SHA-256 ' + digest + ' に一致するものだけ（受領書自身は含まない）。README.md 以外のファイル・.github・approvals 以外の変更、実行、deploy、鍵や権限の変更、公開は許可しない。有効期限内に1つの対象にだけ使える（同じ受領書・同じnonceを別のPRやheadには使えない）。';
+export const bound = { README_TITLE, readmeSummary, PARSE_RE };
+
+// The signed text must name repo + PR number + main base SHA + change-manifest digest, all decided BEFORE signing; here each is compared with the REAL value.
+async function boundCheck(api, cfg, receiptBytes, changes, receiptPath, mainSha) {
+  const rq = parseRequest(parseReceipt(receiptBytes).requestBytes);
+  const m = typeof rq.summary === 'string' ? PARSE_RE.exec(rq.summary) : null;
+  if (!m || rq.repo !== README_REPO || rq.title !== README_TITLE || !/^autonomy-readme-[0-9a-f]{8}$/.test(rq.work_id) || rq.summary !== readmeSummary(m[3], m[1], m[2])) throw new FormatError('BOUND_FORMAT');   // old unbound form lands here
+  if (m[1] !== String(cfg.prNumber)) throw new FormatError('PR_NUMBER_MISMATCH');
+  if (m[2] !== mainSha) throw new FormatError('BASE_MISMATCH');
+  const items = [];
+  for (const c of changes) {
+    if (c.path === receiptPath) continue;                                                  // the receipt itself is the only excluded entry
+    items.push({ path: c.path, before: c.before ? { mode: c.before.mode, bytes: await readBlob(api, cfg.repo, cfg.readToken, c.before, MAX_CONTENT_BYTES, c.path) } : null,
+      after: c.after ? { mode: c.after.mode, bytes: await readBlob(api, cfg.repo, cfg.readToken, c.after, MAX_CONTENT_BYTES, c.path) } : null });
+  }
+  const digest = manifestDigest(buildManifest(items));
+  if (m[3] !== digest) throw new FormatError('MANIFEST_MISMATCH');
+  return { rq, digest };
+}
+
 async function readBlob(api, repo, token, entry, maxBytes, what) {
   if (entry.size !== null && entry.size > maxBytes) throw new FormatError('TOO_LONG', what);
   const b = await api('GET', '/repos/' + repo + '/git/blobs/' + entry.sha, token);
@@ -102,7 +128,8 @@ async function evaluate(api, cfg, approver, nowMs) {
 
   const mainTree = readTree(await readCommitTree(api, repo, readToken, mainSha), 'main');   // (i)
   const headTree = readTree(await readCommitTree(api, repo, readToken, headSha), 'head');   // (i)
-  const { receipt, paths } = splitChanges(diffTrees(mainTree, headTree), mainTree, headTree); // (b) (h)
+  const changes = diffTrees(mainTree, headTree);
+  const { receipt, paths } = splitChanges(changes, mainTree, headTree); // (b) (h)
 
   const receiptBytes = await readBlob(api, repo, readToken, receipt.entry, MAX_RECEIPT_BLOB_BYTES, receipt.path);
   const v = verifyReceipt({                                                                  // (c)-(g)
@@ -110,7 +137,14 @@ async function evaluate(api, cfg, approver, nowMs) {
   });
   checkScope(paths, v.paths);                                                                // (h)
   checkOtherWorkflows(mainTree, approver.otherWorkflows.get(repo));                          // (j)
-  return { mainSha, v, changed: paths.length, receipt: receipt.path };
+  const b = await boundCheck(api, cfg, receiptBytes, changes, receipt.path, mainSha);       // NEW: content/PR/base binding against real values
+  const pr2 = await api('GET', '/repos/' + repo + '/pulls/' + prNumber, readToken);          // NEW: the head we verified is still the head
+  if (!pr2 || !pr2.head || pr2.head.sha !== headSha) throw new FormatError('PR_MOVED');
+  const target = { repo, pr: Number(prNumber), base: mainSha, head: headSha, digest: b.digest };
+  let claim;
+  try { claim = await cfg.store.claim({ nonce: b.rq.nonce, requestHash: v.request_hash, target }); }   // NEW: one-time use, atomic, per nonce AND per request_hash
+  catch (e) { if (e && e.name === 'ClaimError' && e.code === 'CLAIM_CONFLICT') throw new FormatError('CLAIM_CONFLICT'); throw e; }   // an unknown/unreachable store (ClaimUnknown, 5xx, timeout) is NOT a conflict: it becomes status error   // other store errors => state 'error' (fail-closed)
+  return { mainSha, v, changed: paths.length, receipt: receipt.path, target, claim, requestHash: v.request_hash };
 }
 
 export function appJwt(appId, pem, nowSec) {
@@ -177,7 +211,7 @@ export async function runGate(cfg) {
   const log = cfg.log || ((o) => console.log(logLine(o)));
   const sleep = cfg.sleep || realSleep;
   if (typeof cfg.repo !== 'string' || !REPO_RE.test(cfg.repo) || !/^[1-9][0-9]{0,9}$/.test(String(cfg.prNumber)) ||
-      typeof cfg.headSha !== 'string' || !SHA_RE.test(cfg.headSha) || !cfg.readToken || !cfg.approverKeyPem) {
+      typeof cfg.headSha !== 'string' || !SHA_RE.test(cfg.headSha) || !cfg.readToken || !cfg.approverKeyPem || !cfg.store) {
     log({ ok: false, stage: 'input' });
     return 2;
   }
@@ -191,8 +225,9 @@ export async function runGate(cfg) {
 
   let state;
   let description;
+  let ev = null;
   try {
-    const r = await evaluate(api, cfg, approver, nowMs);
+    const r = await evaluate(api, cfg, approver, nowMs); ev = r;
     state = 'success';
     description = describeSuccess(r.v);
     log({ ok: true, work_id: r.v.work_id, request_hash: r.v.request_hash, main: r.mainSha, head: cfg.headSha,
@@ -212,8 +247,30 @@ export async function runGate(cfg) {
     token = await approverToken(api, cfg.repo, approver, cfg.approverKeyPem, Math.floor(cfg.nowMs() / 1000), sleep);
     const body = { state, context: STATUS_CONTEXT, description };
     if (cfg.targetUrl) body.target_url = cfg.targetUrl;
-    await api('POST', '/repos/' + cfg.repo + '/statuses/' + cfg.headSha, token, body);
-    log({ ok: true, stage: 'status', state, description });
+    const readback = async () => { const l = await api('GET', '/repos/' + cfg.repo + '/commits/' + cfg.headSha + '/statuses', cfg.readToken); const x = Array.isArray(l) ? l.find((y) => y && y.context === STATUS_CONTEXT) : null; return !!x && x.state === 'success' && x.description === description; };
+    if (state === 'success' && ev) {
+      // ONE run holds the send right (store.acquireSend is atomic); everyone else only reads the real status back. A send whose outcome is unknown is NEVER re-sent automatically.
+      // GitHub statuses have no idempotency key, so exactly-once and automatic recovery cannot both be promised: retry happens ONLY after a failure that PROVES "not sent" (a definite HTTP 4xx); everything else is held for a person.
+      const hold = (why) => { throw new ApiError('HELD:' + why); };
+      const present = (st, extra) => log({ ok: true, stage: 'status', state, description, note: 'already present', ...extra });
+      const seen = async (st) => { if (!(await readback())) return false; if (st === 'status_pending') await cfg.store.confirm(ev.requestHash, ev.target); return true; };
+      let mayPost = false;
+      if (ev.claim.state === 'confirmed') { if (!(await readback())) hold('CONFIRMED_NOT_VISIBLE'); present(); }
+      else if (ev.claim.state === 'claimed' || ev.claim.state === 'send_refused') {
+        const a = await cfg.store.acquireSend(ev.requestHash, ev.target); mayPost = a.acquired === true;
+        if (!mayPost) { if (await seen(a.state)) present(); else hold(a.state === 'send_refused' ? 'SEND_ATTEMPTS_EXHAUSTED' : 'SEND_RIGHT_HELD_ELSEWHERE'); }
+      } else { if (await seen(ev.claim.state)) present(); else hold('SEND_OUTCOME_UNKNOWN'); }   // status_pending left by an earlier run
+      if (mayPost) {
+        try { await api('POST', '/repos/' + cfg.repo + '/statuses/' + cfg.headSha, token, body); }
+        catch (e) { if (e instanceof ApiError && e.status >= 400 && e.status < 500 && e.status !== 408) await cfg.store.markUnsent(ev.requestHash, ev.target); throw e; }   // only a definite 4xx returns the send right
+        if (!(await readback())) throw new ApiError('status read-back');   // unknown: stays status_pending, held
+        await cfg.store.confirm(ev.requestHash, ev.target);
+        log({ ok: true, stage: 'status', state, description });
+      }
+    } else {
+      await api('POST', '/repos/' + cfg.repo + '/statuses/' + cfg.headSha, token, body);
+      log({ ok: true, stage: 'status', state, description });
+    }
   } catch (e) {
     log({ ok: false, stage: 'status', detail: String(e && e.message ? e.message : e) });
     if (e && e.revokeFailed) log({ ok: false, stage: 'revoke', state: 'revoke_failed' });
@@ -255,6 +312,8 @@ async function main() {
     console.log(logLine({ ok: false, stage: 'files', detail: String(e && e.code ? e.code : e) }));
     process.exit(2);
   }
+  const endpoint = env.XGATE_CLAIM_ENDPOINT; let store;
+  try { store = makeClaimClient({ endpoint, getToken: () => actionsIdToken(env, fetch, 'xgate-claim'), fetch }); } catch (e) { console.log(logLine({ ok: false, stage: 'claim-store', detail: 'CLAIM_ENDPOINT' })); process.exit(2); }   // no endpoint => fail closed
   process.exit(await runGate({
     apiBase: 'https://api.github.com',
     repo: env.GITHUB_REPOSITORY,
@@ -266,6 +325,7 @@ async function main() {
     approverBytes,
     targetUrl: runUrl(env, env.GITHUB_REPOSITORY),
     nowMs: () => Date.now(),
+    store,
   }));
 }
 
