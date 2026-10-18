@@ -6,6 +6,12 @@ export const SITES_ORIGIN = 'https://xgate-connector.tainakaritsu903729.chatgpt.
 export const RECEIPT_URL = SITES_ORIGIN + '/receipt';
 export const REQUEST_FILE = 'dotprobe-request.json';
 export const FIXED_REPO = 'yuta5150rr/dot-probe';
+export const README_REPO = 'yuta5150rr/autonomy-daemon';
+export const README_PATHS = Object.freeze(['README.md']);
+const README_TITLE = 'リポジトリ ' + README_REPO + ' の README.md だけを変更するPRを、1回だけ承認する（他のファイル・workflow・設定は対象外）';
+const PARSE_RE = /対象: .+ のPR#([1-9][0-9]{0,8})（mainのbase SHA ([0-9a-f]{40})）の、.*変更manifest SHA-256 ([0-9a-f]{64}) に一致/;
+const readmeSummary = (digest, pr, base) => '許可する操作はこの1件だけ。対象: ' + README_REPO + ' のPR#' + pr + '（mainのbase SHA ' + base + '）の、README.md の内容変更を含むPR（受領書 approvals/<work_id>.json を同じPRに載せる）を、承認ゲートが通してよい。承認する変更内容は、変更manifest SHA-256 ' + digest + ' に一致するものだけ（受領書自身は含まない）。README.md 以外のファイル・.github・approvals 以外の変更、実行、deploy、鍵や権限の変更、公開は許可しない。有効期限内に1つの対象にだけ使える（同じ受領書・同じnonceを別のPRやheadには使えない）。';
+export function readmeBoundOk(o) { const m = typeof o.summary === 'string' ? PARSE_RE.exec(o.summary) : null; return typeof o.work_id === 'string' && /^autonomy-readme-[0-9a-f]{8}$/.test(o.work_id) && o.title === README_TITLE && !!m && o.summary === readmeSummary(m[3], m[1], m[2]); }   // the REAL file the PR may change; pairs ONLY with README_REPO
 export const FIXED_PATHS = Object.freeze(['dot-probe/readonly-status-check', 'dot-probe/enroll-key-binding', 'dot-probe/claude-resume-readonly', 'dot-probe/flex-readonly-report', 'dot-probe/chief-development-v1', 'dot-probe/chief-recovery-v1', 'dot-probe/c5-keys-check-v1']);
 export const MAX_REQUEST_BYTES = 16384;
 const MAX_FRAGMENT_RECEIPT_BYTES = 65536;
@@ -26,7 +32,10 @@ export function acceptRequestFileBytes(bytes) {
   let o;
   try { o = JSON.parse(text); } catch (e) { return null; }
   if (!o || typeof o !== 'object' || Array.isArray(o) || JSON.stringify(o) !== text) return null;
-  if (o.repo !== FIXED_REPO || !Array.isArray(o.paths) || o.paths.length !== 1 || !FIXED_PATHS.includes(o.paths[0])) return null;
+  if (!Array.isArray(o.paths) || o.paths.length !== 1) return null;
+  const okPair = (o.repo === FIXED_REPO && FIXED_PATHS.includes(o.paths[0])) || (o.repo === README_REPO && README_PATHS.includes(o.paths[0]));   // repo/path PAIRS, never a cross product
+  if (!okPair) return null;
+  if (o.repo === README_REPO && !readmeBoundOk(o)) return null;   // README requests must be the BOUND form (digest in the signed summary); the old unbound form is refused
   return bytes;
 }
 
