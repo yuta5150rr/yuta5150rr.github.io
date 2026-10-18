@@ -754,7 +754,7 @@ async function intakeFixedFile(explicit) {
   }
   try {
     await loadRequest(r.bytes); state.imported = true;
-    if (state.currentBlock) { log('公開ファイルの依頼は署名できない: ' + state.currentBlock, 'bad'); return; }
+    if (state.currentBlock) { log('公開ファイルの依頼は署名できない: ' + state.currentBlock + '。最新の依頼は通知をタップするか、Site /c5check の「未承認の check 依頼を開く」から開く。', 'bad'); return; }
     const sv = savePendingRequest(pendingStorage(), r.bytes, await pendingHash(r.bytes), Date.now(), 'file');
     log(sv.ok ? '公開ファイルの最新の依頼（' + workIdOf(r.bytes) + '）を読み込み、この端末に保存した。機械の値を確かめてから承認する' : '公開ファイルの最新の依頼（' + workIdOf(r.bytes) + '）を読み込んだが、この端末に保存できなかった（' + sv.reason + '）', sv.ok ? 'good' : 'bad');
   } catch (e) { clearPendingRequest(); log('公開ファイルの依頼を表示できなかった（署名は止めた）: ' + errText(e), 'bad'); }
