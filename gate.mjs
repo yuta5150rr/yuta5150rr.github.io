@@ -247,7 +247,8 @@ export async function runGate(cfg) {
     token = await approverToken(api, cfg.repo, approver, cfg.approverKeyPem, Math.floor(cfg.nowMs() / 1000), sleep);
     const body = { state, context: STATUS_CONTEXT, description };
     if (cfg.targetUrl) body.target_url = cfg.targetUrl;
-    const readback = async () => { const l = await api('GET', '/repos/' + cfg.repo + '/commits/' + cfg.headSha + '/statuses', cfg.readToken); const x = Array.isArray(l) ? l.find((y) => y && y.context === STATUS_CONTEXT) : null; return !!x && x.state === 'success' && x.description === description; };
+    const readback = async () => { const l = await api('GET', '/repos/' + cfg.repo + '/commits/' + cfg.headSha + '/statuses', token);   // App token: the workflow read token cannot list statuses (403)
+      const x = Array.isArray(l) ? l.find((y) => y && y.context === STATUS_CONTEXT) : null; return !!x && x.state === 'success' && x.description === description; };
     if (state === 'success' && ev) {
       // ONE run holds the send right (store.acquireSend is atomic); everyone else only reads the real status back. A send whose outcome is unknown is NEVER re-sent automatically.
       // GitHub statuses have no idempotency key, so exactly-once and automatic recovery cannot both be promised: retry happens ONLY after a failure that PROVES "not sent" (a definite HTTP 4xx); everything else is held for a person.
