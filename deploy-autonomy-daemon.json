@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "repo": "yuta5150rr/autonomy-daemon",
+  "account_id": "c609873435cc200858f05d0fabb23076",
+  "script_name": "autonomy-daemon",
+  "main_module": "worker.js",
+  "compatibility_date": "2026-08-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "bindings": [
+    { "type": "d1", "name": "DB", "id": "50578e13-efbb-41a1-9ec3-6ae13fb960ee" },
+    { "type": "plain_text", "name": "NOTIFY_MODE", "text": "shadow" },
+    { "type": "plain_text", "name": "HANDOFF_BASE_URL", "text": "https://handoff-mcp.gooooerer.workers.dev" }
+  ],
+  "inherit_secrets": ["GRAPH_READ_TOKEN", "DETAIL_READ_TOKEN", "READER_KEY", "SINK_KEY", "DEADMAN_PING_URL", "NTFY_URL"],
+  "max_bundle_bytes": 5242880
+}
