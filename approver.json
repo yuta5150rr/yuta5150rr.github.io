@@ -3,6 +3,9 @@
   "app_id": 5218506,
   "slug": "yuta5150rr-approver",
   "other_workflows": {
-    "yuta5150rr/probe": {}
+    "yuta5150rr/probe": {},
+    "yuta5150rr/autonomy-daemon": {
+      ".github/workflows/deploy.yml": "e97b8ec2dc6ded316156b649e337a1e1bf192fcd"
+    }
   }
 }
