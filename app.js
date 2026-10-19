@@ -7,9 +7,10 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
-import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, decideOpenRecord, OPEN_DB, OPEN_STORE, OPEN_KEY, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3n'; // versioned: a cached v0.3c module would reject the resume path
+import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, decideOpenRecord, OPEN_DB, OPEN_STORE, OPEN_KEY, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3o'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
+const BUILD_ID = 'r3-2026-10-19';   // non-secret; shown next to the version so a screenshot says which bytes are running
 const TEST_REPO = 'yuta5150rr/probe';
 const DAY_MS = 24 * 3600 * 1000;
 const DB_NAME = 'approval';
@@ -31,7 +32,13 @@ const state = {
 };
 
 // ---------- small helpers ----------
+// Persistent, bounded, NON-SECRET history of what the page did (the on-screen log is lost on every reload / iOS relaunch). Only the log texts already shown on screen are kept.
+const DIAG_KEY = 'xgate-diag/v1', DIAG_MAX = 40;
+function diagStore() { try { return window.localStorage; } catch (e) { return null; } }
+function diagPush(msg) { const st = diagStore(); if (!st) return; try { const cur = JSON.parse(st.getItem(DIAG_KEY) || '[]'); const arr = Array.isArray(cur) ? cur : []; arr.push({ t: Date.now(), b: BUILD_ID, m: String(msg).slice(0, 200) }); st.setItem(DIAG_KEY, JSON.stringify(arr.slice(-DIAG_MAX))); } catch (e) { /* best effort */ } }
+function diagPrevious() { const st = diagStore(); if (!st) return []; try { const arr = JSON.parse(st.getItem(DIAG_KEY) || '[]'); return Array.isArray(arr) ? arr.filter((x) => x && Number.isFinite(x.t) && typeof x.m === 'string') : []; } catch (e) { return []; } }
 function log(msg, kind) {
+  diagPush(msg);
   const li = document.createElement('li');
   li.textContent = new Date().toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false }) + '  ' + msg;
   if (kind) li.className = kind;
@@ -572,7 +579,7 @@ async function onLocalDisplayTest() {
 }
 function setupPush() {
   if (!pushSupported() || !VAPID_PUBLIC_B64U) return;            // inert: no worker, no button
-  navigator.serviceWorker.register('sw.js', { scope: './' }).then((reg) => { if (reg.waiting) log('通知用ワーカーの新しい版が待機中（アプリを一度閉じると切り替わる。それまでの通知は今のワーカーで扱う）'); }).catch((e) => log('通知用ワーカーを登録できなかった: ' + errText(e), 'bad'));
+  navigator.serviceWorker.register('sw.js', { scope: './' }).then((reg) => { log('通知用ワーカー: 有効=' + (reg.active ? 'あり' : 'なし') + ' 待機=' + (reg.waiting ? 'あり' : 'なし')); if (reg.waiting) log('通知用ワーカーの新しい版が待機中（アプリを一度閉じると切り替わる。それまでの通知は今のワーカーで扱う）'); }).catch((e) => log('通知用ワーカーを登録できなかった: ' + errText(e), 'bad'));
   navigator.serviceWorker.addEventListener('message', (ev) => { onSwMessage(ev); });
   if (typeof navigator.serviceWorker.startMessages === 'function') navigator.serviceWorker.startMessages();   // addEventListener (unlike onmessage) does not start the message queue
   const b = document.createElement('button'); b.type = 'button'; b.id = 'btn-enable-push'; b.textContent = '通知を有効にする（この端末）';
@@ -661,6 +668,26 @@ async function applyOpenRecord() {
   }
   if (drop) { try { await dropOpenRecordIf(rec); } catch (e) { /* a leftover record is re-checked next time */ } }
 }
+
+// Pull path that needs neither a notification nor a tap: on start and on every resume, look at the fixed public file (no-store) and take it ONLY when it is strictly newer than what is
+// shown, unexpired, unsigned and not the same bytes. Anything else changes nothing (a missing/old/expired/unreadable file never clears the displayed request); never during a signing.
+let lastPull = 0;
+async function pullNewerFromFixedFile() {
+  if (state.busy) return;
+  const now = Date.now(); if (now - lastPull < 3000) return; lastPull = now;
+  let r; try { r = await loadFixedRequest((u, init) => fetch(u, init)); } catch (e) { return; }
+  if (!r || r.status !== 'ok') return;
+  if (state.current && sameBytes(state.current.bytes, r.bytes)) return;
+  const fc = createdMs(r.bytes); if (!Number.isFinite(fc)) return;
+  if (state.current) { const cc = createdMs(state.current.bytes); if (Number.isFinite(cc) && fc <= cc) return; }
+  let q; try { q = JSON.parse(new TextDecoder().decode(r.bytes)); } catch (e) { return; }
+  if (!(Date.now() < Date.parse(q.approve_by))) return;
+  if ((await signedState(r.bytes)) !== 'unsigned') return;
+  if (state.busy) return;
+  log('公開ファイルに、表示中より新しい署名待ちの依頼（' + workIdOf(r.bytes) + '）があった。通知を待たずに切り替える', 'good');
+  await loadRequestFromFragment(r.bytes);
+  await redeliverPendingReceipts();
+}
 async function drainIncoming() {
   if (incomingRunning) { incomingDirty = true; return; }
   incomingRunning = true;
@@ -670,6 +697,7 @@ async function drainIncoming() {
       if (state.busy) { incomingDeferred = true; return; }
       await applyIncomingFragment();
       await applyOpenRecord();
+      await pullNewerFromFixedFile();
     } while (incomingDirty);
   } finally { incomingRunning = false; }
 }
@@ -826,7 +854,8 @@ async function init() {
 async function initInner() {
   if (window.top !== window.self) return; // never run inside a frame; the page stays blank
   $('app').hidden = false;
-  $('ver').textContent = PAGE_VERSION;
+  $('ver').textContent = PAGE_VERSION + ' / ' + BUILD_ID;
+  for (const x of diagPrevious().slice(-15)) { const li = document.createElement('li'); li.textContent = '[前回 ' + new Date(x.t).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false }) + ' ' + x.b + '] ' + x.m; li.className = 'prev'; $('log').append(li); }
   const problems = environmentProblems();
   if (problems.length) {
     for (const b of document.querySelectorAll('button')) b.disabled = true;
