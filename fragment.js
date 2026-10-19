@@ -244,3 +244,28 @@ export function receiptReturnUrl(receiptText) {
   if (bytes.length < 2 || bytes.length > MAX_FRAGMENT_RECEIPT_BYTES) return null;
   return RECEIPT_URL + '#r=' + bytesToB64u(bytes);
 }
+
+// ---- tap hand-off record (sw.js -> IndexedDB 'xgate-open' / store 's' / key 'last') ----
+// The service worker stores the verified {id, req} of a tapped approve notification. This never signs or stores a request by itself: the app re-checks everything here,
+// and loads it through the SAME strict path as a Site #req fragment. A tap is the owner's explicit choice, so a valid unexpired unsigned tapped request wins over the
+// displayed / stored / public-file one; it never replaces a signing in progress and never revives an expired or signed one.
+export const OPEN_DB = 'xgate-open', OPEN_STORE = 's', OPEN_KEY = 'last';
+const OPEN_KEYS = 'id,kind,req,ts,v';
+// -> { action: 'load' | 'consume' | 'defer' | 'keep', reason, bytes? }
+//   load = show it (caller then deletes the record); consume = drop the record, change nothing; defer = signing in progress, try again later;
+//   keep = cannot decide yet (signed-state unreadable): change nothing, keep the record
+export async function decideOpenRecord(rec, nowMs, sha256Of, ctx) {
+  if (rec === undefined || rec === null) return { action: 'none', reason: 'empty' };
+  if (typeof rec !== 'object' || Array.isArray(rec) || Object.keys(rec).sort().join() !== OPEN_KEYS || rec.v !== 1 || rec.kind !== 'approve' || typeof rec.id !== 'string' || !/^[0-9a-f]{64}$/.test(rec.id) || !Number.isFinite(rec.ts) || rec.ts > nowMs + SKEW_MS) return { action: 'consume', reason: 'shape' };
+  const bytes = b64uToBytes(rec.req);
+  if (!bytes || !acceptRequestFileBytes(bytes)) return { action: 'consume', reason: 'not a fixed canonical request' };
+  if ((await sha256Of(bytes)) !== rec.id) return { action: 'consume', reason: 'hash mismatch' };
+  let q; try { q = JSON.parse(new TextDecoder().decode(bytes)); } catch (e) { return { action: 'consume', reason: 'json' }; }
+  if (!TS.test(q.approve_by)) return { action: 'consume', reason: 'timestamps' };
+  if (nowMs >= Date.parse(q.approve_by)) return { action: 'consume', reason: 'expired' };
+  if (ctx.busy) return { action: 'defer', reason: 'signing in progress' };
+  if (ctx.sameAsCurrent) return { action: 'consume', reason: 'already displayed' };
+  if (ctx.signed === 'signed') return { action: 'consume', reason: 'already signed' };
+  if (ctx.signed !== 'unsigned') return { action: 'keep', reason: 'signed state unknown' };
+  return { action: 'load', reason: 'tapped', bytes };
+}

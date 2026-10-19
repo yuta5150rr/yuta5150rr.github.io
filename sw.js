@@ -1,6 +1,7 @@
 // sw.js - service worker for web push ONLY: `push` and `notificationclick`.
 // No `fetch` handler, no Cache/Cache Storage, no skipWaiting/claim: it cannot intercept, cache or serve any page, so it can never make an approval screen stale.
-// Notification texts come from this file by kind, never from the payload. A click can only open THIS app's own scope with a request that is cryptographically bound to the id
+// The ONLY thing written is the verified {id,req} of a tapped approve notification, into its own IndexedDB ('xgate-open'): a tap can then never be lost when the OS ignores the URL
+// or the message of an already-open window. The app re-verifies and consumes it. Notification texts come from this file by kind, never from the payload. A click can only open THIS app's own scope with a request that is cryptographically bound to the id
 // (sha-256 of the carried request bytes == id); anything else opens the plain app root. Nothing is ever signed, stored or sent from here.
 'use strict';
 const KINDS = ['approve', 'received', 'completed', 'test'];
@@ -50,9 +51,30 @@ async function targetFor(data) {
   if (p.kind === 'approve') return { url: scope + '?r=' + id16 + '#req=' + p.req, message: { type: 'xgate-open', kind: p.kind, id: p.id, req: p.req } };
   return { url: scope + '?n=' + p.kind + '&r=' + id16, message: { type: 'xgate-open', kind: p.kind, id: p.id, req: null } };
 }
+// tap hand-off: one record, own database. Best effort (never blocks opening the app); the app re-verifies sha-256(req) == id and the strict request rules before using it.
+function putOpen(rec) {
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
+    const timer = setTimeout(() => fin(false), 1500);          // bounded: a blocked / stuck IndexedDB must never delay focusing or opening the app
+    try {
+      const q = indexedDB.open('xgate-open', 1);
+      q.onupgradeneeded = () => { q.result.createObjectStore('s'); };
+      q.onblocked = () => fin(false);
+      q.onerror = () => fin(false);
+      q.onsuccess = () => {
+        const db = q.result;
+        db.onversionchange = () => { try { db.close(); } catch (e) { /* closing is best effort */ } };
+        if (done) { try { db.close(); } catch (e) { /* late connection */ } return; }
+        try { const tx = db.transaction('s', 'readwrite'); tx.objectStore('s').put(rec, 'last'); tx.oncomplete = () => { db.close(); fin(true); }; tx.onerror = () => { db.close(); fin(false); }; tx.onabort = () => { db.close(); fin(false); }; } catch (e) { try { db.close(); } catch (e2) { /* ignore */ } fin(false); }
+      };
+    } catch (e) { fin(false); }
+  });
+}
 async function onClick(event) {
   event.notification.close();
   const t = await targetFor(event.notification.data);
+  if (t.message && t.message.kind === 'approve') await putOpen({ v: 1, kind: 'approve', id: t.message.id, req: t.message.req, ts: Date.now() });
   const scope = self.registration.scope;
   const wins = (await clients.matchAll({ type: 'window', includeUncontrolled: true })).filter((c) => typeof c.url === 'string' && c.url.startsWith(scope));
   if (wins.length) {                       // the open app decides (it never swaps a target while a signing is in progress)

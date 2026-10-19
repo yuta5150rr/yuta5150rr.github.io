@@ -7,7 +7,7 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
-import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3m'; // versioned: a cached v0.3c module would reject the resume path
+import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, decideOpenRecord, OPEN_DB, OPEN_STORE, OPEN_KEY, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3n'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const TEST_REPO = 'yuta5150rr/probe';
@@ -572,7 +572,7 @@ async function onLocalDisplayTest() {
 }
 function setupPush() {
   if (!pushSupported() || !VAPID_PUBLIC_B64U) return;            // inert: no worker, no button
-  navigator.serviceWorker.register('sw.js', { scope: './' }).catch((e) => log('通知用ワーカーを登録できなかった: ' + errText(e), 'bad'));
+  navigator.serviceWorker.register('sw.js', { scope: './' }).then((reg) => { if (reg.waiting) log('通知用ワーカーの新しい版が待機中（アプリを一度閉じると切り替わる。それまでの通知は今のワーカーで扱う）'); }).catch((e) => log('通知用ワーカーを登録できなかった: ' + errText(e), 'bad'));
   navigator.serviceWorker.addEventListener('message', (ev) => { onSwMessage(ev); });
   if (typeof navigator.serviceWorker.startMessages === 'function') navigator.serviceWorker.startMessages();   // addEventListener (unlike onmessage) does not start the message queue
   const b = document.createElement('button'); b.type = 'button'; b.id = 'btn-enable-push'; b.textContent = '通知を有効にする（この端末）';
@@ -625,6 +625,42 @@ async function applyIncomingFragment() {
   if (out.saved || !out.shown) scrubIf(raw);
   await redeliverPendingReceipts();
 }
+
+// ---- tap hand-off (sw.js stores the verified tapped request; see fragment.js decideOpenRecord) ----
+function openHandoffDb() { return new Promise((res, rej) => { const q = indexedDB.open(OPEN_DB, 1); q.onupgradeneeded = () => { q.result.createObjectStore(OPEN_STORE); }; q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); }
+async function openRecordOp(mode, fn) { const db = await openHandoffDb(); try { return await new Promise((res, rej) => { const tx = db.transaction(OPEN_STORE, mode); const r = fn(tx.objectStore(OPEN_STORE)); tx.oncomplete = () => res(r && r.result); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error); }); } finally { db.close(); } }
+// delete the record ONLY if it is still exactly the one that was processed (a newer tap written meanwhile must survive); one readwrite transaction = compare + delete
+function dropOpenRecordIf(rec) {
+  return openHandoffDb().then((db) => new Promise((res, rej) => {
+    const tx = db.transaction(OPEN_STORE, 'readwrite'); const st = tx.objectStore(OPEN_STORE); const g = st.get(OPEN_KEY);
+    g.onsuccess = () => { const c = g.result; if (c && typeof c === 'object' && c.id === rec.id && c.req === rec.req && c.ts === rec.ts) st.delete(OPEN_KEY); };
+    tx.oncomplete = () => { db.close(); res(); }; tx.onerror = () => { db.close(); rej(tx.error); }; tx.onabort = () => { db.close(); rej(tx.error); };
+  }));
+}
+async function applyOpenRecord() {
+  let rec; try { rec = await openRecordOp('readonly', (st) => st.get(OPEN_KEY)); } catch (e) { return; }
+  if (rec === undefined) return;
+  const now = Date.now();
+  let bytes = null; try { bytes = rec && typeof rec.req === 'string' ? b64uToBytes(rec.req) : null; } catch (e) { bytes = null; }
+  const ctx = { busy: state.busy, sameAsCurrent: !!(bytes && state.current && sameBytes(state.current.bytes, bytes)), signed: bytes ? await signedState(bytes) : 'unsigned' };
+  const d = await decideOpenRecord(rec, now, pendingHash, ctx);
+  let drop = true;
+  if (d.action === 'defer') { incomingDeferred = true; return; }
+  if (d.action === 'keep') { log('通知で開いた依頼が署名済みか確認できない。何も変えていない', 'bad'); return; }
+  if (d.action === 'load') {
+    const out = await loadRequestFromFragment(d.bytes);
+    log(out.shown ? '通知で開いた依頼（' + workIdOf(d.bytes) + '）を表示した' : '通知で開いた依頼を表示できなかった。記録は残す', out.shown ? 'good' : 'bad');
+    await redeliverPendingReceipts();
+    drop = out.shown && out.saved;   // not shown / not saved on this device: keep the hand-off so a reload or the next resume re-imports the very same request (same intent as keeping an unsaved #req in the URL)
+  } else if (d.action === 'consume') {
+    if (d.reason === 'already displayed' && unsavedMarked()) {   // shown but never saved on this device: keep the hand-off until a save succeeds
+      const sv = savePendingRequest(pendingStorage(), bytes, await pendingHash(bytes), Date.now(), 'fragment');
+      if (sv.ok) { setUnsavedMark(false); log('通知で開いた依頼をこの端末に保存できた', 'good'); } else drop = false;
+    }
+    else if (d.reason !== 'already displayed') log('通知で開いた依頼は使わなかった（' + d.reason + '）', d.reason === 'expired' || d.reason === 'already signed' ? undefined : 'bad');
+  }
+  if (drop) { try { await dropOpenRecordIf(rec); } catch (e) { /* a leftover record is re-checked next time */ } }
+}
 async function drainIncoming() {
   if (incomingRunning) { incomingDirty = true; return; }
   incomingRunning = true;
@@ -633,6 +669,7 @@ async function drainIncoming() {
       incomingDirty = false;
       if (state.busy) { incomingDeferred = true; return; }
       await applyIncomingFragment();
+      await applyOpenRecord();
     } while (incomingDirty);
   } finally { incomingRunning = false; }
 }
@@ -782,8 +819,9 @@ async function init() {
   incomingRunning = true;
   window.addEventListener('hashchange', () => { drainIncoming(); });
   window.addEventListener('pageshow', () => { drainIncoming(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') drainIncoming(); });
   try { await initInner(); } finally { incomingRunning = false; }
-  if (incomingDirty || location.hash.startsWith('#req=')) await drainIncoming();
+  await drainIncoming();   // also picks up a tap hand-off left by the service worker when the URL / message did not reach this page
 }
 async function initInner() {
   if (window.top !== window.self) return; // never run inside a frame; the page stays blank
