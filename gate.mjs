@@ -77,13 +77,20 @@ const README_REPO = 'yuta5150rr/autonomy-daemon', MAX_CONTENT_BYTES = 1048576;
 const README_TITLE = 'リポジトリ ' + README_REPO + ' の README.md だけを変更するPRを、1回だけ承認する（他のファイル・workflow・設定は対象外）';
 const PARSE_RE = /対象: .+ のPR#([1-9][0-9]{0,8})（mainのbase SHA ([0-9a-f]{40})）の、.*変更manifest SHA-256 ([0-9a-f]{64}) に一致/;
 const readmeSummary = (digest, pr, base) => '許可する操作はこの1件だけ。対象: ' + README_REPO + ' のPR#' + pr + '（mainのbase SHA ' + base + '）の、README.md の内容変更を含むPR（受領書 approvals/<work_id>.json を同じPRに載せる）を、承認ゲートが通してよい。承認する変更内容は、変更manifest SHA-256 ' + digest + ' に一致するものだけ（受領書自身は含まない）。README.md 以外のファイル・.github・approvals 以外の変更、実行、deploy、鍵や権限の変更、公開は許可しない。有効期限内に1つの対象にだけ使える（同じ受領書・同じnonceを別のPRやheadには使えない）。';
-export const bound = { README_TITLE, readmeSummary, PARSE_RE };
+const IMPORT_PATHS = Object.freeze(['.gitignore', '.npmrc', 'README.md', 'docs/**', 'package-lock.json', 'package.json', 'src/**', 'test/**', 'tsconfig.json', 'vitest.config.ts', 'wrangler.jsonc']);   // G6: the fixed import request
+const importTitle = () => 'リポジトリ ' + README_REPO + ' に、検査済みの取り込み木（src・test・docs・設定ファイル）だけを入れるPRを、1回だけ承認する（.github・workflowは対象外）';
+const importSummary = (digest, pr, base) => '許可する操作はこの1件だけ。対象: ' + README_REPO + ' のPR#' + pr + '（mainのbase SHA ' + base + '）の、取り込み木（README.md・.gitignore・.npmrc・package.json・package-lock.json・tsconfig.json・vitest.config.ts・wrangler.jsonc と、docs/・src/・test/ の中身）の追加・変更だけを含むPR（受領書 approvals/<work_id>.json を同じPRに載せる）を、承認ゲートが通してよい。承認する変更内容は、変更manifest SHA-256 ' + digest + ' に一致するものだけ（受領書自身は含まない）。上記以外のファイル・.github・approvals 以外の変更、実行、deploy、鍵や権限の変更、公開は許可しない。有効期限内に1つの対象にだけ使える（同じ受領書・同じnonceを別のPRやheadには使えない）。';
+export const bound = { README_TITLE, readmeSummary, PARSE_RE, IMPORT_PATHS, importTitle, importSummary };
 
 // The signed text must name repo + PR number + main base SHA + change-manifest digest, all decided BEFORE signing; here each is compared with the REAL value.
 async function boundCheck(api, cfg, receiptBytes, changes, receiptPath, mainSha) {
   const rq = parseRequest(parseReceipt(receiptBytes).requestBytes);
   const m = typeof rq.summary === 'string' ? PARSE_RE.exec(rq.summary) : null;
-  if (!m || rq.repo !== README_REPO || rq.title !== README_TITLE || !/^autonomy-readme-[0-9a-f]{8}$/.test(rq.work_id) || rq.summary !== readmeSummary(m[3], m[1], m[2])) throw new FormatError('BOUND_FORMAT');   // old unbound form lands here
+  const isImport = typeof rq.work_id === 'string' && /^autonomy-import-[0-9a-f]{8}$/.test(rq.work_id), samePaths = (a, b) => Array.isArray(a) && a.length === b.length && a.every((x, i) => x === b[i]);
+  const formOk = !!m && rq.repo === README_REPO && (isImport
+    ? rq.title === importTitle() && rq.summary === importSummary(m[3], m[1], m[2]) && samePaths(rq.paths, IMPORT_PATHS)
+    : /^autonomy-readme-[0-9a-f]{8}$/.test(rq.work_id) && rq.title === README_TITLE && rq.summary === readmeSummary(m[3], m[1], m[2]) && samePaths(rq.paths, ['README.md']));
+  if (!formOk) throw new FormatError('BOUND_FORMAT');   // old unbound form, a mixed form or other paths land here
   if (m[1] !== String(cfg.prNumber)) throw new FormatError('PR_NUMBER_MISMATCH');
   if (m[2] !== mainSha) throw new FormatError('BASE_MISMATCH');
   const items = [];
@@ -171,6 +178,14 @@ export function tokenProblem(t, repo) {
   return null;
 }
 
+// Sanitized installation facts for the log (names/levels from fixed alphabets only; nothing else of the response is printed).
+export function installationFacts(inst) {
+  const sel = inst && (inst.repository_selection === 'all' || inst.repository_selection === 'selected') ? inst.repository_selection : '?';
+  const perms = {}; const src = inst && inst.permissions && typeof inst.permissions === 'object' && !Array.isArray(inst.permissions) ? inst.permissions : {};
+  for (const k of Object.keys(src).sort().slice(0, 30)) if (/^[a-z_]{1,40}$/.test(k)) perms[k] = ['read', 'write', 'admin'].includes(src[k]) ? src[k] : '?';
+  return { ok: true, stage: 'installation', repository_selection: sel, permissions: perms, events: Array.isArray(inst && inst.events) ? Math.min(inst.events.length, 99) : '?' };
+}
+
 // DELETE /installation/token, up to 3 tries. 204 = revoked; 401 = the token no longer works (expired
 // or already revoked). Returns false when neither could be confirmed: that is revoke_failed.
 async function revoke(api, token, sleep) {
@@ -184,13 +199,14 @@ async function revoke(api, token, sleep) {
 }
 
 // A token of the approval App that can only write commit statuses on this one repository.
-async function approverToken(api, repo, approver, pem, nowSec, sleep) {
+async function approverToken(api, repo, approver, pem, nowSec, sleep, onInstallation) {
   const [owner, name] = repo.split('/');
   const jwt = appJwt(approver.appId, pem, nowSec);
   const inst = await api('GET', '/repos/' + repo + '/installation', jwt);
   if (!inst || inst.app_id !== approver.appId || !Number.isSafeInteger(inst.id) || !inst.account || inst.account.login !== owner) {
     throw new ApiError('installation of the approval App');
   }
+  if (typeof onInstallation === 'function') onInstallation(inst);   // facts the gate already holds; logged sanitized, never used for a decision
   const t = await api('POST', '/app/installations/' + inst.id + '/access_tokens', jwt,
     { repositories: [name], permissions: { statuses: 'write' } });
   if (!t || typeof t.token !== 'string' || t.token.length < 20) throw new ApiError('approval App token');
@@ -244,7 +260,7 @@ export async function runGate(cfg) {
   let token = null;
   let exit = state === 'success' ? 0 : 1;
   try {
-    token = await approverToken(api, cfg.repo, approver, cfg.approverKeyPem, Math.floor(cfg.nowMs() / 1000), sleep);
+    token = await approverToken(api, cfg.repo, approver, cfg.approverKeyPem, Math.floor(cfg.nowMs() / 1000), sleep, (i) => log(installationFacts(i)));
     const body = { state, context: STATUS_CONTEXT, description };
     if (cfg.targetUrl) body.target_url = cfg.targetUrl;
     const readback = async () => { const l = await api('GET', '/repos/' + cfg.repo + '/commits/' + cfg.headSha + '/statuses', token);   // App token: the workflow read token cannot list statuses (403)
