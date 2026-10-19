@@ -7,10 +7,12 @@ import {
   challengeMessage, deviceMessage, checkClientData, checkAuthenticatorData,
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
-import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, decideOpenRecord, OPEN_DB, OPEN_STORE, OPEN_KEY, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3o'; // versioned: a cached v0.3c module would reject the resume path
+import { viewOfRequestBytes } from './rr-codec.js';
+import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, decideOpenRecord, OPEN_DB, OPEN_STORE, OPEN_KEY, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3p'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
-const BUILD_ID = 'r4-2026-10-19';   // non-secret; shown next to the version so a screenshot says which bytes are running
+const MAILBOX_ORIGIN = 'https://xgate-mailbox.gooooerer.workers.dev';   // public read-only mailbox the Site writes (signed); also listed in the CSP connect-src of index.html
+const BUILD_ID = 'r6-2026-10-19';   // non-secret; shown next to the version so a screenshot says which bytes are running
 const TEST_REPO = 'yuta5150rr/probe';
 const DAY_MS = 24 * 3600 * 1000;
 const DB_NAME = 'approval';
@@ -343,6 +345,13 @@ function addRow(dl, label, value, cls) {
   dl.append(dt, dd);
 }
 
+// Common RR: Japanese-headed rows generated from EVERY signed field (rr-codec viewRows) + the raw signed summary. textContent only; nothing here signs or stores.
+function rrPanel(v) {
+  const box = document.createElement('div'); box.className = 'rr-view';
+  const dl = document.createElement('dl'); for (const r of v.rows) addRow(dl, r.label, r.value, /^[0-9a-f]{40,64}$/.test(r.value) ? 'mono' : undefined); box.append(dl);
+  const det = document.createElement('details'), sm = document.createElement('summary'), pre = document.createElement('pre');
+  sm.textContent = '署名対象の生データ（summary 全文）'; pre.textContent = v.raw; pre.className = 'mono'; det.append(sm, pre); box.append(det); return box;
+}
 function renderRequest() {
   const cur = state.current;
   $('request').hidden = !cur;
@@ -376,8 +385,10 @@ function renderRequest() {
   t.textContent = q.title;
   const s = document.createElement('p');
   s.dir = 'ltr';
-  s.textContent = q.summary || '（なし）';
-  ai.append(t, s);
+  const rrv = viewOfRequestBytes(cur.bytes);   // null for every request that is not a common RR: the existing display is unchanged
+  if (rrv && rrv.rows) { s.textContent = '以下は、署名する内容のすべてから機械的に作った表示です（省略なし）。署名される生の文面は一番下で確認できます。'; ai.append(t, s); ai.append(rrPanel(rrv)); }
+  else if (rrv) { s.textContent = '共通依頼として読めない文面です。署名しないでください。'; ai.append(t, s); }
+  else { s.textContent = q.summary || '（なし）'; ai.append(t, s); }
 
   $('req-hash').textContent = '依頼の指紋 ' + toHex(cur.challenge).slice(0, 16);
   state.currentBlock = timeBlock(q, Date.now());
@@ -723,6 +734,47 @@ async function logLastPush() {
   if (!r || typeof r !== 'object' || !Number.isFinite(r.t)) { log('この端末の通知用ワーカーが受け取った通知の記録: なし'); return; }
   log('通知用ワーカーが最後に受け取った通知: ' + new Date(r.t).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false }) + ' ' + String(r.kind).slice(0, 12) + ' ' + String(r.id16 || '').slice(0, 16) + (r.ok === true ? '' : '（中身を読めなかった）'));
 }
+
+// Mailbox pull: the Site writes every approve request (signed) to the public xgate-mailbox Worker; on start/resume the page reads the list and takes the NEWEST request that passes the SAME checks as every other route
+// (hash == id, strict request, unexpired, unsigned) and is strictly newer than the displayed one. Independent of Web Push, taps, the service worker and per-request GitHub publishing. Non-destructive: an unreachable/bad answer changes nothing.
+let lastMailboxPull = 0, mailboxFailLogged = false;
+// The Site signs "xgate-mailbox/v1\n" + request-sha256 with the key it already holds for Web Push; the matching PUBLIC key (VAPID_PUBLIC_B64U) is already in this app. A forged or replaced list item has no valid signature.
+let mailboxKey = null;
+async function mailboxSigOk(id, sigB64u) {
+  try {
+    const sig = b64uToBytes(sigB64u); if (!sig || sig.length !== 64 || !/^[0-9a-f]{64}$/.test(id)) return false;
+    if (!mailboxKey) mailboxKey = await crypto.subtle.importKey('raw', b64uToBytes(VAPID_PUBLIC_B64U), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, mailboxKey, sig, new TextEncoder().encode('xgate-mailbox/v1\n' + id));
+  } catch (e) { return false; }
+}
+async function pullFromMailbox() {
+  if (state.busy) return;
+  const now = Date.now(); if (now - lastMailboxPull < 5000) return; lastMailboxPull = now;
+  let list;
+  try {
+    const res = await fetch(MAILBOX_ORIGIN + '/v1/pending', { cache: 'no-store', credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(8000) });
+    if (res.status !== 200) throw new Error('http');
+    const text = await res.text(); if (text.length > 40000) throw new Error('size'); list = JSON.parse(text);
+  } catch (e) { if (!mailboxFailLogged) { mailboxFailLogged = true; log('受信箱に接続できなかった（通知・公開ファイルの経路は引き続き使う）'); } return; }
+  mailboxFailLogged = false;
+  if (!list || list.v !== 1 || !Array.isArray(list.items) || list.items.length > 4) return;
+  let best = null;
+  for (const it of list.items) {
+    if (!it || typeof it !== 'object' || typeof it.id !== 'string' || typeof it.req !== 'string' || typeof it.sig !== 'string') continue;
+    if (!(await mailboxSigOk(it.id, it.sig))) continue;   // the item must carry the Site's signature over 'xgate-mailbox/v1\n<id>' (the PWA does not trust the mailbox Worker or whoever deploys it)
+    let bytes = null; try { bytes = b64uToBytes(it.req); } catch (e) { bytes = null; } if (!bytes) continue;
+    const ctx = { busy: false, sameAsCurrent: !!(state.current && sameBytes(state.current.bytes, bytes)), signed: await signedState(bytes) };
+    const d = await decideOpenRecord({ v: 1, kind: 'approve', id: it.id, req: it.req, ts: Date.now() }, Date.now(), pendingHash, ctx);
+    if (d.action !== 'load') continue;
+    const fc = createdMs(d.bytes); if (!Number.isFinite(fc)) continue;
+    if (!best || fc > best.fc) best = { bytes: d.bytes, fc };
+  }
+  if (!best) return;
+  if (state.current) { const cc = createdMs(state.current.bytes); if (Number.isFinite(cc) && best.fc <= cc) return; }
+  if (state.busy) return;
+  log('受信箱に、表示中より新しい署名待ちの依頼（' + workIdOf(best.bytes) + '）があった。通知を待たずに切り替える', 'good');
+  await loadRequestFromFragment(best.bytes); await redeliverPendingReceipts();
+}
 async function drainIncoming() {
   if (incomingRunning) { incomingDirty = true; return; }
   incomingRunning = true;
@@ -733,6 +785,7 @@ async function drainIncoming() {
       await applyIncomingFragment();
       await applyOpenRecord();
       await pullNewerFromInbox();
+      await pullFromMailbox();
       await pullNewerFromFixedFile();
     } while (incomingDirty);
   } finally { incomingRunning = false; }

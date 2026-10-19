@@ -2,6 +2,7 @@
 // the caller passes the fetch function and this module only ever hands it ONE fixed same-origin path.
 // IN : the exact request bytes the Sites authority issued, placed at ONE fixed same-origin file (public data only: no secret/receipt/token).
 // OUT: top-level navigation to ONE fixed Sites page with the receipt in the URL fragment (never sent to a server by the browser).
+import { rrFromRequest, RR_PREFIX } from './rr-codec.js';
 export const SITES_ORIGIN = 'https://xgate-connector.tainakaritsu903729.chatgpt.site';
 export const RECEIPT_URL = SITES_ORIGIN + '/receipt';
 export const REQUEST_FILE = 'dotprobe-request.json';
@@ -36,6 +37,7 @@ export function acceptRequestFileBytes(bytes) {
   let o;
   try { o = JSON.parse(text); } catch (e) { return null; }
   if (!o || typeof o !== 'object' || Array.isArray(o) || JSON.stringify(o) !== text) return null;
+  if (typeof o.work_id === 'string' && o.work_id.startsWith(RR_PREFIX)) { try { rrFromRequest(o); return bytes; } catch (e) { return null; } }   // common RR: the whole record is re-derived from the signed summary and must equal every other field
   const isImport = Array.isArray(o.paths) && o.paths.length === IMPORT_PATHS.length && o.paths.every((p, i) => p === IMPORT_PATHS[i]);   // exactly the ONE fixed multi-path request
   if (!Array.isArray(o.paths) || (o.paths.length !== 1 && !isImport)) return null;
   if (isImport) return o.repo === README_REPO && importBoundOk(o) ? bytes : null;
