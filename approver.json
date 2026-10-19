@@ -5,7 +5,8 @@
   "other_workflows": {
     "yuta5150rr/probe": {},
     "yuta5150rr/autonomy-daemon": {
-      ".github/workflows/deploy.yml": "e97b8ec2dc6ded316156b649e337a1e1bf192fcd"
+      ".github/workflows/deploy.yml": "1fd522dcb91acf75719fba318f092768d731b5fe",
+      ".github/workflows/k4-readonly-readback.yml": "49c8224561a1bb9edbf1b76e452000b8914c61a4"
     }
   }
 }
