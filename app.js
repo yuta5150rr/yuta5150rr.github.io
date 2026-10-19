@@ -10,7 +10,7 @@ import {
 import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, decideOpenRecord, OPEN_DB, OPEN_STORE, OPEN_KEY, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3o'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
-const BUILD_ID = 'r3-2026-10-19';   // non-secret; shown next to the version so a screenshot says which bytes are running
+const BUILD_ID = 'r4-2026-10-19';   // non-secret; shown next to the version so a screenshot says which bytes are running
 const TEST_REPO = 'yuta5150rr/probe';
 const DAY_MS = 24 * 3600 * 1000;
 const DB_NAME = 'approval';
@@ -577,9 +577,19 @@ async function onLocalDisplayTest() {
     log('端末内の表示テストを出した。通知が表示されたか確認してください', 'good');
   } catch (e) { log('表示テストを出せなかった: ' + errText(e), 'bad'); }
 }
+
+// non-secret description of the push subscription of THIS device: presence, push-service host, first 8 hex of sha-256(endpoint) (= the Site's endpoint_sha256 prefix), notification permission
+async function logSubscription(reg) {
+  try {
+    const sub = reg && reg.pushManager ? await reg.pushManager.getSubscription() : null; const perm = typeof Notification !== 'undefined' ? Notification.permission : '?';
+    if (!sub) { log('通知の購読: なし（許可=' + perm + '）。「通知を有効にする」で登録する', 'bad'); return; }
+    const ep = String(sub.endpoint || ''); let host = '?'; try { host = new URL(ep).host; } catch (e) { /* keep ? */ }
+    log('通知の購読: あり host=' + host + ' h=' + (await pendingHash(new TextEncoder().encode(ep))).slice(0, 8) + '（許可=' + perm + '）');
+  } catch (e) { log('通知の購読を読めなかった', 'bad'); }
+}
 function setupPush() {
   if (!pushSupported() || !VAPID_PUBLIC_B64U) return;            // inert: no worker, no button
-  navigator.serviceWorker.register('sw.js', { scope: './' }).then((reg) => { log('通知用ワーカー: 有効=' + (reg.active ? 'あり' : 'なし') + ' 待機=' + (reg.waiting ? 'あり' : 'なし')); if (reg.waiting) log('通知用ワーカーの新しい版が待機中（アプリを一度閉じると切り替わる。それまでの通知は今のワーカーで扱う）'); }).catch((e) => log('通知用ワーカーを登録できなかった: ' + errText(e), 'bad'));
+  navigator.serviceWorker.register('sw.js', { scope: './' }).then((reg) => { logSubscription(reg); log('通知用ワーカー: 有効=' + (reg.active ? 'あり' : 'なし') + ' 待機=' + (reg.waiting ? 'あり' : 'なし')); if (reg.waiting) log('通知用ワーカーの新しい版が待機中（アプリを一度閉じると切り替わる。それまでの通知は今のワーカーで扱う）'); }).catch((e) => log('通知用ワーカーを登録できなかった: ' + errText(e), 'bad'));
   navigator.serviceWorker.addEventListener('message', (ev) => { onSwMessage(ev); });
   if (typeof navigator.serviceWorker.startMessages === 'function') navigator.serviceWorker.startMessages();   // addEventListener (unlike onmessage) does not start the message queue
   const b = document.createElement('button'); b.type = 'button'; b.id = 'btn-enable-push'; b.textContent = '通知を有効にする（この端末）';
@@ -637,10 +647,10 @@ async function applyIncomingFragment() {
 function openHandoffDb() { return new Promise((res, rej) => { const q = indexedDB.open(OPEN_DB, 1); q.onupgradeneeded = () => { q.result.createObjectStore(OPEN_STORE); }; q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); }
 async function openRecordOp(mode, fn) { const db = await openHandoffDb(); try { return await new Promise((res, rej) => { const tx = db.transaction(OPEN_STORE, mode); const r = fn(tx.objectStore(OPEN_STORE)); tx.oncomplete = () => res(r && r.result); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error); }); } finally { db.close(); } }
 // delete the record ONLY if it is still exactly the one that was processed (a newer tap written meanwhile must survive); one readwrite transaction = compare + delete
-function dropOpenRecordIf(rec) {
+function dropOpenRecordIf(rec, key = OPEN_KEY) {
   return openHandoffDb().then((db) => new Promise((res, rej) => {
-    const tx = db.transaction(OPEN_STORE, 'readwrite'); const st = tx.objectStore(OPEN_STORE); const g = st.get(OPEN_KEY);
-    g.onsuccess = () => { const c = g.result; if (c && typeof c === 'object' && c.id === rec.id && c.req === rec.req && c.ts === rec.ts) st.delete(OPEN_KEY); };
+    const tx = db.transaction(OPEN_STORE, 'readwrite'); const st = tx.objectStore(OPEN_STORE); const g = st.get(key);
+    g.onsuccess = () => { const c = g.result; if (c && typeof c === 'object' && c.id === rec.id && c.req === rec.req && c.ts === rec.ts) st.delete(key); };
     tx.oncomplete = () => { db.close(); res(); }; tx.onerror = () => { db.close(); rej(tx.error); }; tx.onabort = () => { db.close(); rej(tx.error); };
   }));
 }
@@ -688,6 +698,31 @@ async function pullNewerFromFixedFile() {
   await loadRequestFromFragment(r.bytes);
   await redeliverPendingReceipts();
 }
+
+// The inbox: the verified approve request of every push that reached the service worker (written even when the tap / window routing later fails). Same checks as the tap record
+// (decideOpenRecord: hash == id, strict request, unexpired, unsigned, not busy), PLUS strictly newer than what is shown; a record that cannot be used is dropped, a busy/unknown one is kept.
+async function pullNewerFromInbox() {
+  if (state.busy) return;
+  let rec; try { rec = await openRecordOp('readonly', (st) => st.get('inbox')); } catch (e) { return; }
+  if (rec === undefined) return;
+  let bytes = null; try { bytes = rec && typeof rec.req === 'string' ? b64uToBytes(rec.req) : null; } catch (e) { bytes = null; }
+  const ctx = { busy: state.busy, sameAsCurrent: !!(bytes && state.current && sameBytes(state.current.bytes, bytes)), signed: bytes ? await signedState(bytes) : 'unsigned' };
+  const d = await decideOpenRecord(rec, Date.now(), pendingHash, ctx);
+  if (d.action === 'defer' || d.action === 'keep' || d.action === 'none') return;
+  let drop = true;
+  if (d.action === 'load') {
+    const fc = createdMs(d.bytes), cc = state.current ? createdMs(state.current.bytes) : NaN;
+    if (state.current && Number.isFinite(cc) && Number.isFinite(fc) && fc <= cc) return;   // not newer than what is shown: leave it (a newer tap/file decides)
+    log('通知で受け取っていた依頼（' + workIdOf(d.bytes) + '）を、押さなくても読み込む', 'good');
+    const out = await loadRequestFromFragment(d.bytes); await redeliverPendingReceipts(); drop = out.shown && out.saved;
+  }
+  if (drop) { try { await dropOpenRecordIf(rec, 'inbox'); } catch (e) { /* re-checked next time */ } }
+}
+async function logLastPush() {
+  let r; try { r = await openRecordOp('readonly', (st) => st.get('lastpush')); } catch (e) { return; }
+  if (!r || typeof r !== 'object' || !Number.isFinite(r.t)) { log('この端末の通知用ワーカーが受け取った通知の記録: なし'); return; }
+  log('通知用ワーカーが最後に受け取った通知: ' + new Date(r.t).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false }) + ' ' + String(r.kind).slice(0, 12) + ' ' + String(r.id16 || '').slice(0, 16) + (r.ok === true ? '' : '（中身を読めなかった）'));
+}
 async function drainIncoming() {
   if (incomingRunning) { incomingDirty = true; return; }
   incomingRunning = true;
@@ -697,6 +732,7 @@ async function drainIncoming() {
       if (state.busy) { incomingDeferred = true; return; }
       await applyIncomingFragment();
       await applyOpenRecord();
+      await pullNewerFromInbox();
       await pullNewerFromFixedFile();
     } while (incomingDirty);
   } finally { incomingRunning = false; }
@@ -886,6 +922,7 @@ async function initInner() {
   $('btn-test-request').before(reload, document.createElement('br'));
   setupPush();
   await startupLoad();
+  await logLastPush();
   if (!isStandalone()) log('ホーム画面アプリではない。セットアップは「ホーム画面に追加」した方で行う。');
 }
 

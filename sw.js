@@ -1,6 +1,6 @@
 // sw.js - service worker for web push ONLY: `push` and `notificationclick`.
 // No `fetch` handler, no Cache/Cache Storage, no skipWaiting/claim: it cannot intercept, cache or serve any page, so it can never make an approval screen stale.
-// The ONLY thing written is the verified {id,req} of a tapped approve notification, into its own IndexedDB ('xgate-open'): a tap can then never be lost when the OS ignores the URL
+// Written (best effort, own IndexedDB 'xgate-open'): the verified {id,req} of a tapped approve notification ('last'), the verified approve request of every received push ('inbox'), and a one-line arrival note of every push ('lastpush'): a tap can then never be lost when the OS ignores the URL
 // or the message of an already-open window. The app re-verifies and consumes it. Notification texts come from this file by kind, never from the payload. A click can only open THIS app's own scope with a request that is cryptographically bound to the id
 // (sha-256 of the carried request bytes == id); anything else opens the plain app root. Nothing is ever signed, stored or sent from here.
 'use strict';
@@ -36,9 +36,12 @@ async function onPush(event) {
   let p = { ok: false };
   try { p = await parsePayloadText(event.data ? event.data.text() : ''); } catch (e) { p = { ok: false }; }
   // Safari revokes the permission if a push is not shown: ALWAYS show something, even for an undecryptable / malformed payload.
-  if (!p.ok) return self.registration.showNotification(GENERIC[0], { body: GENERIC[1], tag: 'xgate-generic', data: null });
+  if (!p.ok) { await self.registration.showNotification(GENERIC[0], { body: GENERIC[1], tag: 'xgate-generic', data: null }); await putRec('lastpush', { v: 1, t: Date.now(), kind: 'unparsed', id16: '', ok: false }); return; }
   const t = TEXTS[p.kind];
   await self.registration.showNotification(t[0], { body: t[1], tag: p.kind + '-' + p.id.slice(0, 16), renotify: false, data: { kind: p.kind, id: p.id, req: p.req } });
+  // AFTER the notification is shown (never before): remember that a push reached this worker, and keep the verified approve request in an inbox so the app can load it even if the tap / window routing fails
+  await putRec('lastpush', { v: 1, t: Date.now(), kind: p.kind, id16: p.id.slice(0, 16), ok: true });
+  if (p.kind === 'approve') await putRec('inbox', { v: 1, kind: 'approve', id: p.id, req: p.req, ts: Date.now() });
   // best effort, AFTER showNotification resolved: tell an open app window that the notification really was displayed (the push service's HTTP 201 only means "accepted")
   try { for (const c of await clients.matchAll({ type: 'window', includeUncontrolled: true })) if (typeof c.url === 'string' && c.url.startsWith(self.registration.scope)) c.postMessage({ type: 'xgate-displayed', kind: p.kind, id: p.id }); } catch (e) { /* display already happened */ }
 }
@@ -52,7 +55,7 @@ async function targetFor(data) {
   return { url: scope + '?n=' + p.kind + '&r=' + id16, message: { type: 'xgate-open', kind: p.kind, id: p.id, req: null } };
 }
 // tap hand-off: one record, own database. Best effort (never blocks opening the app); the app re-verifies sha-256(req) == id and the strict request rules before using it.
-function putOpen(rec) {
+function putRec(key, rec) {
   return new Promise((resolve) => {
     let done = false;
     const fin = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
@@ -66,7 +69,7 @@ function putOpen(rec) {
         const db = q.result;
         db.onversionchange = () => { try { db.close(); } catch (e) { /* closing is best effort */ } };
         if (done) { try { db.close(); } catch (e) { /* late connection */ } return; }
-        try { const tx = db.transaction('s', 'readwrite'); tx.objectStore('s').put(rec, 'last'); tx.oncomplete = () => { db.close(); fin(true); }; tx.onerror = () => { db.close(); fin(false); }; tx.onabort = () => { db.close(); fin(false); }; } catch (e) { try { db.close(); } catch (e2) { /* ignore */ } fin(false); }
+        try { const tx = db.transaction('s', 'readwrite'); tx.objectStore('s').put(rec, key); tx.oncomplete = () => { db.close(); fin(true); }; tx.onerror = () => { db.close(); fin(false); }; tx.onabort = () => { db.close(); fin(false); }; } catch (e) { try { db.close(); } catch (e2) { /* ignore */ } fin(false); }
       };
     } catch (e) { fin(false); }
   });
@@ -74,7 +77,7 @@ function putOpen(rec) {
 async function onClick(event) {
   event.notification.close();
   const t = await targetFor(event.notification.data);
-  if (t.message && t.message.kind === 'approve') await putOpen({ v: 1, kind: 'approve', id: t.message.id, req: t.message.req, ts: Date.now() });
+  if (t.message && t.message.kind === 'approve') await putRec('last', { v: 1, kind: 'approve', id: t.message.id, req: t.message.req, ts: Date.now() });
   const scope = self.registration.scope;
   const wins = (await clients.matchAll({ type: 'window', includeUncontrolled: true })).filter((c) => typeof c.url === 'string' && c.url.startsWith(scope));
   if (wins.length) {                       // the open app decides (it never swaps a target while a signing is in progress)
