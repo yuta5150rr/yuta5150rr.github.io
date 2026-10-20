@@ -441,6 +441,26 @@ function onlyThisVersion(versions, versionId) {
     versions[0].version_id === versionId && versions[0].percentage === 100;
 }
 
+// Which part of the Create Deployment answer failed the check above, without logging any value of it (the answer itself is never logged).
+// Only: types, an array length, key NAMES that look like plain identifiers (at most 20, at most 30 characters each) and booleans.
+function describeDeployResponse(dep, versionId) {
+  const names = (o) => (isObject(o) ? Object.keys(o).filter((k) => /^[A-Za-z_]{1,30}$/.test(k)).sort().slice(0, 20) : null);
+  const vs = isObject(dep) && Array.isArray(dep.versions) ? dep.versions : null;
+  const v0 = vs && vs.length ? vs[0] : undefined;
+  return {
+    dep_type: dep === null ? 'null' : Array.isArray(dep) ? 'array' : typeof dep,
+    dep_keys: names(dep),
+    id_type: isObject(dep) ? typeof dep.id : null,
+    id_is_uuid: isObject(dep) && typeof dep.id === 'string' && UUID_RE.test(dep.id),
+    versions_type: isObject(dep) ? (Array.isArray(dep.versions) ? 'array' : typeof dep.versions) : null,
+    versions_len: vs ? vs.length : null,
+    v0_keys: names(v0),
+    v0_version_id_is_uploaded: isObject(v0) && v0.version_id === versionId,
+    v0_percentage_type: isObject(v0) ? typeof v0.percentage : null,
+    v0_percentage_is_100: isObject(v0) && v0.percentage === 100,
+  };
+}
+
 // ---------- the whole run ----------
 // cfg: { env, cfToken, ghToken, manifestBytes, inputDir, fetch, sleep?, log, openFile? }
 // Returns { exit, outcome, deployment, ... } and logs one line per stage. Never logs a token, the bundle
@@ -536,6 +556,7 @@ export async function runDeploy(cfg) {
     });
     deploymentId = isObject(dep) ? dep.id : undefined;
     if (typeof deploymentId !== 'string' || !UUID_RE.test(deploymentId) || !onlyThisVersion(dep.versions, versionId)) {
+      log({ ok: false, stage: 'deploy_response_shape', ...describeDeployResponse(dep, versionId) });   // diagnostics only: types, lengths, key NAMES and booleans; never a value, never the body
       return stop(2, 'readback_failed', 'unknown', { at: 'deploy_response', version_id: versionId });
     }
     log({ ok: true, stage: 'deploy', deployment_id: deploymentId, version_id: versionId });
