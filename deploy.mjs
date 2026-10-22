@@ -555,11 +555,14 @@ export async function runDeploy(cfg) {
       },
     });
     deploymentId = isObject(dep) ? dep.id : undefined;
-    if (typeof deploymentId !== 'string' || !UUID_RE.test(deploymentId) || !onlyThisVersion(dep.versions, versionId)) {
+    // Plan A: Create Deployment may answer with just { id } (seen in production, run #4). The id must still be a UUID. When `versions` is absent it is not
+    // evidence either way, so step 9 (the list read back: first entry = this id, only the uploaded version, 100 %) is the check. When `versions` IS present it must match exactly as before.
+    const versionsAbsent = isObject(dep) && !has(dep, 'versions');
+    if (typeof deploymentId !== 'string' || !UUID_RE.test(deploymentId) || (!versionsAbsent && !onlyThisVersion(dep.versions, versionId))) {
       log({ ok: false, stage: 'deploy_response_shape', ...describeDeployResponse(dep, versionId) });   // diagnostics only: types, lengths, key NAMES and booleans; never a value, never the body
       return stop(2, 'readback_failed', 'unknown', { at: 'deploy_response', version_id: versionId });
     }
-    log({ ok: true, stage: 'deploy', deployment_id: deploymentId, version_id: versionId });
+    log({ ok: true, stage: 'deploy', deployment_id: deploymentId, version_id: versionId, ...(versionsAbsent ? { response_versions: 'absent_checked_at_readback' } : {}) });
   } catch (e) {
     if (e instanceof ApiError) {
       if (e.refusal) return stop(2, 'deploy_refused', 'refused', { version_id: versionId, detail: e.message });
