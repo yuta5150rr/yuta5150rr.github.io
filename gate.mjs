@@ -91,7 +91,7 @@ const RRC = (() => {
 const PATH_CLASSES = Object.freeze({ readme: Object.freeze(['README.md']), import: Object.freeze(['.gitignore', '.npmrc', 'README.md', 'docs/**', 'package-lock.json', 'package.json', 'src/**', 'test/**', 'tsconfig.json', 'vitest.config.ts', 'wrangler.jsonc']) });
 const RR_MAX_REQUEST_BYTES = 4096;   // = the mailbox Worker's MAX_REQ; the largest request any registered operation produces today is 2219 B (test)
 const VERIFY_EXTRA_MS = 2 * 3600e3;   // verify_by = expires_at + 2 h (the PR gate may run after the signing window; the signing deadline stays expires_at)
-const RR_REPO = 'yuta5150rr/autonomy-daemon', RR_PREFIX = 'xgate-rr-', MAX_SUMMARY = 2000, MAX_TTL_MS = 24 * 3600e3;
+const RR_REPO = 'yuta5150rr/autonomy-daemon', RR_PREFIX = 'xgate-rr-', MAX_SUMMARY = 2000, MAX_TTL_MS = 7 * 24 * 3600e3;
 const K256 = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
 function sha256Hex(str) {   // pure JS (sync) so the browser-side acceptance stays synchronous; verified against node:crypto in the tests
   const b = new TextEncoder().encode(str), l = b.length, n = (((l + 9 + 63) >> 6) << 6), m = new Uint8Array(n); m.set(b); m[l] = 0x80; const dv = new DataView(m.buffer); dv.setUint32(n - 4, (l * 8) >>> 0); dv.setUint32(n - 8, Math.floor((l * 8) / 4294967296));
@@ -116,7 +116,7 @@ function validateRR(rr) {
   if (!plain(rr.operation) || Object.keys(rr.operation).sort().join() !== 'args,type' || typeof rr.operation.type !== 'string' || !/^[a-z_]{3,40}$/.test(rr.operation.type) || !plain(rr.operation.args)) return 'operation';
   if (typeof rr.impact !== 'string' || rr.impact.length < 20 || rr.impact.length > 800 || /[\n\r]/.test(rr.impact)) return 'impact (one line, 20..800)'; if (typeof rr.rollback !== 'string' || rr.rollback.length < 5 || /[\n\r]/.test(rr.rollback)) return 'rollback (one line)';
   if (!Array.isArray(rr.excludes) || rr.excludes.length < 1 || rr.excludes.some((x) => typeof x !== 'string' || !x || /[\n\r]/.test(x))) return 'excludes'; if (typeof rr.nonce !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(rr.nonce)) return 'nonce';
-  if (typeof rr.created_at !== 'string' || typeof rr.expires_at !== 'string' || !isoRe.test(rr.created_at) || !isoRe.test(rr.expires_at)) return 'timestamps'; const ttl = Date.parse(rr.expires_at) - Date.parse(rr.created_at); if (!(ttl > 0 && ttl <= MAX_TTL_MS)) return 'ttl (0..24 h)';
+  if (typeof rr.created_at !== 'string' || typeof rr.expires_at !== 'string' || !isoRe.test(rr.created_at) || !isoRe.test(rr.expires_at)) return 'timestamps'; const ttl = Date.parse(rr.expires_at) - Date.parse(rr.created_at); if (!(ttl > 0 && ttl <= MAX_TTL_MS)) return 'ttl (0..7 d)';
   if (rr.operation.type === 'pr_change' && !(Object.hasOwn(PATH_CLASSES, rr.operation.args.scope))) return 'pr_change scope';
   if (badText(rr)) return 'forbidden character (control/invisible/bidi) in a text field';
   return null;
