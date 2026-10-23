@@ -8,11 +8,11 @@ import {
   isBroadPattern, patternTouchesForbidden, signingBlock,
 } from './core.js';
 import { viewOfRequestBytes } from './rr-codec.js';
-import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, decideOpenRecord, OPEN_DB, OPEN_STORE, OPEN_KEY, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage } from './fragment.js?v=3p'; // versioned: a cached v0.3c module would reject the resume path
+import { loadFixedRequest, receiptReturnUrl, requestFromFragment, savePendingRequest, readPendingRequest, clearPendingRecord, markPendingSigned, decideOpenRecord, OPEN_DB, OPEN_STORE, OPEN_KEY, saveReceipt, loadReceipts, noteReceiptAttempt, MAX_AUTO_REDELIVERIES, VAPID_PUBLIC_B64U, b64uToBytes, buildEnrollmentUrl, routeFromSearch, routeMatchesRequest, verifyOpenMessage, clearReceipt, HANDOFF_PENDING_URL, HANDOFF_RECEIPT_URL, HANDOFF_PULL_PREFIX, isHandoffRequestBytes, classifyHandoffReceiptResult } from './fragment.js?v=r7'; // versioned: a cached v0.3c module would reject the resume path
 
 const PAGE_VERSION = 'stage 0 / v0.2 (2026-10-04)';
 const MAILBOX_ORIGIN = 'https://xgate-mailbox.gooooerer.workers.dev';   // public read-only mailbox the Site writes (signed); also listed in the CSP connect-src of index.html
-const BUILD_ID = 'r6-2026-10-19';   // non-secret; shown next to the version so a screenshot says which bytes are running
+const BUILD_ID = 'r7-2026-10-23';   // non-secret; shown next to the version so a screenshot says which bytes are running
 const TEST_REPO = 'yuta5150rr/probe';
 const DAY_MS = 24 * 3600 * 1000;
 const DB_NAME = 'approval';
@@ -489,9 +489,9 @@ function onApprove() {
       requestBytes: cur.bytes, credentialId, authenticatorData, clientDataJSON, passkeySignature, deviceSignature,
     });
     state.receiptName = 'receipt-' + cur.request.work_id + '.json';
-    await persistSignedReceipt(cur);   // BEFORE any navigation: exact receipt, bound to this request, durable; the target is marked signed (never offered again)
+    const kept = await persistSignedReceipt(cur);   // BEFORE any navigation / POST: exact receipt, bound to this request, durable; the target is marked signed (never offered again)
     log('受領書を作った（' + cur.request.work_id + '）。「受領書を保存」で渡す', 'good');
-    if (state.imported) returnToSites();
+    if (state.imported) { if (isHandoffRequestBytes(cur.bytes)) await deliverToHandoff(state.receiptText, kept && kept.ok ? kept.id : null); else returnToSites(); }   // handoff requests go to handoff-mcp (one fixed POST); every other request keeps the Sites return
   }).catch((e) => log('承認できなかった: ' + errText(e), 'bad'))
     .finally(() => { state.busy = false; renderStatus(); runDeferredIncoming(); });
 }
@@ -735,6 +735,75 @@ async function logLastPush() {
   log('通知用ワーカーが最後に受け取った通知: ' + new Date(r.t).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false }) + ' ' + String(r.kind).slice(0, 12) + ' ' + String(r.id16 || '').slice(0, 16) + (r.ok === true ? '' : '（中身を読めなかった）'));
 }
 
+// ---------- handoff (r7): ask handoff-mcp what waits for my signature; return the signed receipt to it ----------
+// iOS cannot open this standalone app from a link, so the app ASKS (on start / resume, throttled, never during a signing). The question is signed by the DEVICE key with a message
+// no other signature of this system uses ('handoff-pull/v1\n' + ts + '\n' + nonce); the answer is only a list of frozen request bytes. NOTHING in the answer is trusted: every item goes through
+// the same strict gate as every other route (acceptRequestFileBytes = the BOUND handoff form, hash == id, unexpired, unsigned) and the owner still reads it and signs with Face ID.
+// The receipt goes back with ONE fixed POST (HANDOFF_RECEIPT_URL). 200 / ALREADY_USED = delivered; any other 4xx = final (cleared, said so); network / 5xx = kept and retried (bounded).
+let lastHandoffPull = 0, handoffFailLogged = false;
+async function pullFromHandoff() {
+  if (state.busy) return;
+  const now = Date.now(); if (now - lastHandoffPull < 5000) return; lastHandoffPull = now;
+  let rec = null; try { rec = state.record || await dbGet(); } catch (e) { rec = null; }
+  if (!rec || !rec.deviceKeyPair) return;   // no device key yet: nothing to ask with (and nothing to sign with)
+  let list;
+  try {
+    const ts = Date.now(), nonce = b64uEncode(crypto.getRandomValues(new Uint8Array(16)));
+    const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, rec.deviceKeyPair.privateKey, utf8(HANDOFF_PULL_PREFIX + ts + '\n' + nonce)));
+    const res = await fetch(HANDOFF_PENDING_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ v: 1, ts, nonce, sig: b64uEncode(sig) }), cache: 'no-store', credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(8000) });
+    if (res.status !== 200) throw new Error('http');
+    const text = await res.text(); if (text.length > 20000) throw new Error('size'); list = JSON.parse(text);
+  } catch (e) { if (!handoffFailLogged) { handoffFailLogged = true; log('handoff に問い合わせできなかった（ほかの経路は引き続き使う）'); } return; }
+  handoffFailLogged = false;
+  if (!list || list.v !== 1 || !Array.isArray(list.items) || list.items.length > 4) return;
+  let best = null;
+  for (const it of list.items) {
+    if (!it || typeof it !== 'object' || typeof it.request !== 'string') continue;
+    let bytes = null; try { bytes = b64uToBytes(it.request); } catch (e) { bytes = null; } if (!bytes) continue;
+    const ctx = { busy: false, sameAsCurrent: !!(state.current && sameBytes(state.current.bytes, bytes)), signed: await signedState(bytes) };
+    const d = await decideOpenRecord({ v: 1, kind: 'approve', id: await pendingHash(bytes), req: it.request, ts: Date.now() }, Date.now(), pendingHash, ctx);
+    if (d.action !== 'load') continue;
+    const fc = createdMs(d.bytes); if (!Number.isFinite(fc)) continue;
+    if (!best || fc > best.fc) best = { bytes: d.bytes, fc };
+  }
+  if (!best) return;
+  if (state.current) { const cc = createdMs(state.current.bytes); if (Number.isFinite(cc) && best.fc <= cc) return; }
+  if (state.busy) return;
+  log('handoff に、表示中より新しい署名待ちの依頼（' + workIdOf(best.bytes) + '）があった', 'good');
+  await loadRequestFromFragment(best.bytes); await redeliverPendingReceipts();
+}
+let handoffDelivering = false;
+async function deliverToHandoff(receiptText, id) {
+  if (typeof receiptText !== 'string' || handoffDelivering) return false;
+  handoffDelivering = true;
+  try {
+    let res, j = {};
+    try {
+      res = await fetch(HANDOFF_RECEIPT_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: receiptText, cache: 'no-store', credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(15000) });
+      try { j = JSON.parse((await res.text()).slice(0, 4000)); } catch (e) { j = {}; }
+    } catch (e) { log('handoff へ受領書を返せなかった（通信）。受領書はこの端末に保持している。あとで同じものを再送する', 'bad'); return false; }
+    const verdict = classifyHandoffReceiptResult(res.status, typeof j.code === 'string' ? j.code : '');
+    if (verdict === 'delivered') {
+      if (id) clearReceipt(pendingStorage(), id);
+      log(res.status === 200 ? 'handoff が受領書を受け取り、本丸を書いた（新しい revision ' + String(j.new_revision || '').slice(0, 24) + '）' : 'この受領書は handoff に受理済み（ALREADY_USED）', 'good');
+      return true;
+    }
+    if (verdict === 'final') {
+      if (id) clearReceipt(pendingStorage(), id);
+      log('handoff はこの受領書を受け付けなかった（' + res.status + ' ' + String(j.code || '') + '）。この受領書は二度と使えない。必要なら新しく依頼してもらう', 'bad');
+      return false;
+    }
+    log('handoff が一時的に受け付けられなかった（' + res.status + ' ' + String(j.code || '') + '）。受領書は保持している。あとで同じものを再送する', 'bad');
+    return false;
+  } finally { handoffDelivering = false; renderStatus().catch(() => {}); }
+}
+function offerHandoffButton(item) {
+  let b = $('btn-handoff-' + item.id);
+  if (!b) { b = document.createElement('button'); b.type = 'button'; b.id = 'btn-handoff-' + item.id; $('btn-save-receipt').after(b); }
+  b.textContent = '署名済みで未返送の受領書を handoff へ返す（' + item.id.slice(0, 8) + '）';
+  b.onclick = () => { noteReceiptAttempt(pendingStorage(), item.id); deliverToHandoff(item.receiptText, item.id); };
+}
+
 // Mailbox pull: the Site writes every approve request (signed) to the public xgate-mailbox Worker; on start/resume the page reads the list and takes the NEWEST request that passes the SAME checks as every other route
 // (hash == id, strict request, unexpired, unsigned) and is strictly newer than the displayed one. Independent of Web Push, taps, the service worker and per-request GitHub publishing. Non-destructive: an unreachable/bad answer changes nothing.
 let lastMailboxPull = 0, mailboxFailLogged = false;
@@ -786,6 +855,7 @@ async function drainIncoming() {
       await applyOpenRecord();
       await pullNewerFromInbox();
       await pullFromMailbox();
+      await pullFromHandoff();
       await pullNewerFromFixedFile();
     } while (incomingDirty);
   } finally { incomingRunning = false; }
@@ -809,12 +879,13 @@ async function redeliverPendingReceipts() {
   const signed = state.current ? null : await readPendingRequest(pendingStorage(), Date.now(), pendingHash);
   const same = (b) => signed && signed.status === 'signed' && signed.bytes && signed.bytes.length === b.length && signed.bytes.every((x, i) => x === b[i]);
   const auto = r.items.find((it) => same(it.requestBytes) && it.attempts < MAX_AUTO_REDELIVERIES);
-  for (const it of r.items) if (it !== auto) offerRecoveryLink(it);
+  for (const it of r.items) if (it !== auto) { if (isHandoffRequestBytes(it.requestBytes)) offerHandoffButton(it); else offerRecoveryLink(it); }
   const others = r.items.filter((it) => it !== auto).length;
   if (others) log('署名済みで未返送の前の受領書が' + others + '件ある（保持している）。現在の依頼はそのまま。必要なら表示のリンクから返す', 'bad');
   if (!auto) return;
   state.receiptText = auto.receiptText; state.receiptName = 'receipt-redelivery.json';
   noteReceiptAttempt(pendingStorage(), auto.id);
+  if (isHandoffRequestBytes(auto.requestBytes)) { log('署名済みの受領書がまだ handoff へ返っていない可能性がある。同じ受領書を再送する（新しい署名はしない）', 'good'); await deliverToHandoff(auto.receiptText, auto.id); return; }
   log('署名済みの受領書がまだSiteへ返っていない可能性がある。同じ受領書を再送する（新しい署名はしない）', 'good');
   returnToSites();
 }

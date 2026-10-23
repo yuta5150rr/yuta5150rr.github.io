@@ -19,6 +19,34 @@ export function readmeBoundOk(o) { const m = typeof o.summary === 'string' ? PAR
 export function importBoundOk(o) { const m = typeof o.summary === 'string' ? PARSE_RE.exec(o.summary) : null; return typeof o.work_id === 'string' && /^autonomy-import-[0-9a-f]{8}$/.test(o.work_id) && o.title === importTitle() && !!m && o.summary === importSummary(m[3], m[1], m[2]); }   // the BOUND import form: repo + PR + base + manifest digest in the signed text
 export const FIXED_PATHS = Object.freeze(['dot-probe/readonly-status-check', 'dot-probe/enroll-key-binding', 'dot-probe/claude-resume-readonly', 'dot-probe/flex-readonly-report', 'dot-probe/chief-development-v1', 'dot-probe/chief-recovery-v1', 'dot-probe/c5-keys-check-v1']);
 export const MAX_REQUEST_BYTES = 16384;
+// ---- handoff-mcp (r7, 2026-10-23): the owner's 本丸 approval. ONE fixed origin; the app asks it what waits for a signature (device-key signed, read-only) and returns the signed receipt to it. ----
+export const HANDOFF_ORIGIN = 'https://handoff-mcp.gooooerer.workers.dev';
+export const HANDOFF_PENDING_URL = HANDOFF_ORIGIN + '/approval/pending';
+export const HANDOFF_RECEIPT_URL = HANDOFF_ORIGIN + '/approval/receipt';
+export const HANDOFF_REPO = 'yuta5150rr/handoff-decision';   // a reserved name, never a real repository (design v0.3 decision 3)
+export const HANDOFF_PULL_PREFIX = 'handoff-pull/v1\n';      // domain separation: used by no other signature of this system
+const HANDOFF_PROJECT_RE = /^[a-z0-9](?:[a-z0-9-]{0,44}[a-z0-9])?$/;
+const HANDOFF_SUMMARY_RE = /^本丸：[^／\n]+ ／ 理由：[^／\n]+ ／ base_revision：[A-Za-z0-9._:-]{1,80}$/;
+// The BOUND handoff form (like readmeBoundOk): every field is re-derived from the project id; nothing else is accepted for this repo.
+export function handoffFocusBoundOk(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o) || o.repo !== HANDOFF_REPO || o.v !== 1) return false;
+  if (Object.keys(o).sort().join() !== 'approve_by,created_at,nonce,paths,repo,summary,title,v,verify_by,work_id') return false;
+  if (!Array.isArray(o.paths) || o.paths.length !== 1 || typeof o.paths[0] !== 'string') return false;
+  const m = /^handoff\/([^/]+)\/focus$/.exec(o.paths[0]); if (!m || !HANDOFF_PROJECT_RE.test(m[1])) return false;
+  const p = m[1];
+  const idPrefix = 'hf-' + p + '-focus-';
+  return typeof o.work_id === 'string' && o.work_id.startsWith(idPrefix) && /^[0-9a-f]{8}$/.test(o.work_id.slice(idPrefix.length))
+    && o.title === '本丸を変える：' + p
+    && typeof o.summary === 'string' && HANDOFF_SUMMARY_RE.test(o.summary);
+}
+export function isHandoffRequestBytes(bytes) { try { const o = JSON.parse(new TextDecoder().decode(bytes)); return !!o && o.repo === HANDOFF_REPO; } catch (e) { return false; } }
+// A refusal of the receipt route is final (the receipt can never be accepted) or transient (retry later). 200 and ALREADY_USED = it is in.
+export function classifyHandoffReceiptResult(status, code) {
+  if (status === 200) return 'delivered';
+  if (status === 409 && code === 'ALREADY_USED') return 'delivered';
+  if (status === 400 || status === 404 || status === 409 || status === 410) return 'final';
+  return 'transient';
+}
 const MAX_FRAGMENT_RECEIPT_BYTES = 65536;
 
 function bytesToB64u(bytes) {
@@ -38,6 +66,7 @@ export function acceptRequestFileBytes(bytes) {
   try { o = JSON.parse(text); } catch (e) { return null; }
   if (!o || typeof o !== 'object' || Array.isArray(o) || JSON.stringify(o) !== text) return null;
   if (typeof o.work_id === 'string' && o.work_id.startsWith(RR_PREFIX)) { try { rrFromRequest(o); return bytes; } catch (e) { return null; } }   // common RR: the whole record is re-derived from the signed summary and must equal every other field
+  if (o.repo === HANDOFF_REPO) return handoffFocusBoundOk(o) ? bytes : null;   // r7: the handoff 本丸 form, strictly bound; every other repo/path pair below is unchanged
   const isImport = Array.isArray(o.paths) && o.paths.length === IMPORT_PATHS.length && o.paths.every((p, i) => p === IMPORT_PATHS[i]);   // exactly the ONE fixed multi-path request
   if (!Array.isArray(o.paths) || (o.paths.length !== 1 && !isImport)) return null;
   if (isImport) return o.repo === README_REPO && importBoundOk(o) ? bytes : null;
