@@ -36,3 +36,8 @@ button.danger { color: var(--bad); }
 .log { font-size: .85rem; padding-left: 0; list-style: none; }
 .log li { border-bottom: 1px solid var(--line); padding: .2rem 0; overflow-wrap: anywhere; }
 [hidden] { display: none !important; }
+/* Common RR approval rows (display only): the generic `dl` is a 2-column grid whose first column is max-content, so a long Japanese label (e.g. 検証の期限（署名の後にゲートが読める期限）) takes the whole width and squeezes the value column to ~0, which then breaks one character per line. Inside .rr-view the rows are stacked: label above value. */
+.rr-view dl { grid-template-columns: minmax(0, 1fr); gap: 0; }
+.rr-view dt { margin-top: .7rem; font-size: .85rem; }
+.rr-view dd { min-width: 0; }
+.rr-view pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .4rem 0 0; }
