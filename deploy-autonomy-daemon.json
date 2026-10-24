@@ -11,6 +11,6 @@
     { "type": "plain_text", "name": "NOTIFY_MODE", "text": "shadow" },
     { "type": "plain_text", "name": "HANDOFF_BASE_URL", "text": "https://handoff-mcp.gooooerer.workers.dev" }
   ],
-  "inherit_secrets": ["GRAPH_READ_TOKEN", "DETAIL_READ_TOKEN", "READER_KEY", "SINK_KEY", "DEADMAN_PING_URL", "NTFY_URL"],
+  "inherit_secrets": ["GRAPH_READ_TOKEN", "DETAIL_READ_TOKEN", "READER_KEY", "SINK_KEY", "DEADMAN_PING_URL", "NTFY_URL", "ROUTINE_FIRE_URL", "ROUTINE_FIRE_TOKEN"],
   "max_bundle_bytes": 5242880
 }
